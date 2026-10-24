@@ -3,6 +3,7 @@ import type { Session } from "@supabase/supabase-js";
 import {
   ArrowRight,
   BadgeCheck,
+  CalendarDays,
   Check,
   CircleAlert,
   ClipboardList,
@@ -36,6 +37,17 @@ import {
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "./supabase";
 import { LocationPicker } from "./Location-Picker";
+import {
+  CountUp,
+  KpiTile,
+  MiniColumns,
+  RankBars,
+  SalesTrendChart,
+  SectionNav,
+  type ColumnItem,
+  type KpiDelta,
+  type RankItem,
+} from "./analytics-charts";
 import type {
   ContainerType,
   DocumentRequirement,
@@ -65,6 +77,7 @@ interface PsgcDivision {
 interface StationOrder {
   id: string;
   order_number: number;
+  customer_id: string;
   status: string;
   payment_method: string;
   total: number;
@@ -72,6 +85,8 @@ interface StationOrder {
   address_snapshot: Record<string, unknown>;
   customer_notes: string | null;
   created_at: string;
+  delivered_at: string | null;
+  estimated_delivery_at: string | null;
   items: Array<{
     product_name_snapshot: string;
     water_type_snapshot: string;
@@ -84,6 +99,28 @@ interface StationOrder {
   rider_number: number | null;
   rider_name: string | null;
   rider_phone: string | null;
+}
+
+interface AnalyticsOrder {
+  id: string;
+  order_number: number;
+  customer_id: string;
+  status: string;
+  total: number;
+  delivery_fee: number;
+  address_snapshot: Record<string, unknown>;
+  created_at: string;
+  delivered_at: string | null;
+  estimated_delivery_at: string | null;
+  payment_status: string | null;
+}
+
+interface AnalyticsOrderItem {
+  id: string;
+  order_id: string;
+  water_type_snapshot: string;
+  container_type_snapshot: string;
+  quantity: number;
 }
 
 const nextOrderStatus: Record<string, { status: string; label: string }> = {
@@ -127,6 +164,30 @@ const money = (value: number | null | undefined) =>
     currency: "PHP",
     maximumFractionDigits: 2,
   }).format(Number(value ?? 0));
+
+const moneyWhole = (value: number) =>
+  new Intl.NumberFormat("en-PH", {
+    style: "currency",
+    currency: "PHP",
+    maximumFractionDigits: 0,
+  }).format(value);
+
+const moneyCompact = (value: number) =>
+  new Intl.NumberFormat("en-PH", {
+    style: "currency",
+    currency: "PHP",
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
+
+const wholeNumber = (value: number) => Math.round(value).toLocaleString("en-PH");
+
+const analyticsSections = [
+  { id: "an-sales", label: "Sales" },
+  { id: "an-products", label: "Products & customers" },
+  { id: "an-delivery", label: "Delivery & stock" },
+  { id: "an-orders", label: "Recent orders" },
+];
 
 function readable(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
@@ -254,6 +315,153 @@ function greetingForNow() {
   if (hour < 12) return "Good morning";
   if (hour < 18) return "Good afternoon";
   return "Good evening";
+}
+
+function getManilaDateParts(date: Date) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return { year: values.year, month: values.month, day: values.day };
+}
+
+function getManilaDateString(date = new Date()) {
+  const { year, month, day } = getManilaDateParts(date);
+  return `${year}-${month}-${day}`;
+}
+
+function getDefaultAnalyticsRange() {
+  const today = getManilaDateString();
+  return { startDate: `${today.slice(0, 7)}-01`, endDate: today };
+}
+
+function addCalendarDays(value: string, amount: number) {
+  const date = new Date(`${value}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
+}
+
+function getAnalyticsRangeBounds(startDate: string, endDate: string) {
+  const dayCount = Math.floor(
+    (new Date(`${endDate}T00:00:00Z`).getTime() - new Date(`${startDate}T00:00:00Z`).getTime())
+      / 86_400_000,
+  ) + 1;
+  return {
+    start: `${startDate}T00:00:00+08:00`,
+    end: `${addCalendarDays(endDate, 1)}T00:00:00+08:00`,
+    dayCount,
+  };
+}
+
+function getPreviousAnalyticsRange(startDate: string, dayCount: number) {
+  const endDate = addCalendarDays(startDate, -1);
+  const previousStartDate = addCalendarDays(endDate, -dayCount + 1);
+  return getAnalyticsRangeBounds(previousStartDate, endDate);
+}
+
+function formatAnalyticsRange(startDate: string, endDate: string) {
+  const formatter = new Intl.DateTimeFormat("en-PH", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "Asia/Manila",
+  });
+  const start = formatter.format(new Date(`${startDate}T12:00:00+08:00`));
+  const end = formatter.format(new Date(`${endDate}T12:00:00+08:00`));
+  return startDate === endDate ? start : `${start} – ${end}`;
+}
+
+function isCancelledOrder(status: string) {
+  return status.toLowerCase() === "cancelled" || status.toLowerCase() === "canceled";
+}
+
+function orderSalesAmount(order: { total: number; delivery_fee: number }) {
+  return Math.max(0, Number(order.total) - Number(order.delivery_fee));
+}
+
+function orderCustomerName(addressSnapshot: Record<string, unknown>, orderNumber: number) {
+  const recipientName = addressSnapshot.recipient_name;
+  return typeof recipientName === "string" && recipientName.trim()
+    ? recipientName.trim()
+    : `Customer #${orderNumber}`;
+}
+
+async function fetchAnalyticsRange(
+  stationId: string,
+  start: string,
+  end: string,
+  includeItems = true,
+) {
+  if (!supabase) throw new Error("Supabase is not configured. Monthly analytics could not be loaded.");
+  const pageSize = 1000;
+  const analyticsOrders: AnalyticsOrder[] = [];
+  let orderOffset = 0;
+
+  while (true) {
+    const { data, error } = await supabase.from("orders")
+      .select("id, order_number, customer_id, status, total, delivery_fee, address_snapshot, created_at, delivered_at, estimated_delivery_at")
+      .eq("station_id", stationId)
+      .gte("created_at", start)
+      .lt("created_at", end)
+      .order("created_at", { ascending: false })
+      .range(orderOffset, orderOffset + pageSize - 1);
+    if (error) throw error;
+    const page = (data ?? []) as AnalyticsOrder[];
+    analyticsOrders.push(...page);
+    if (page.length < pageSize) break;
+    orderOffset += pageSize;
+  }
+
+  const analyticsItems: AnalyticsOrderItem[] = [];
+  const orderIds = analyticsOrders.map((order) => order.id);
+  for (let index = 0; index < orderIds.length; index += 100) {
+    const batch = orderIds.slice(index, index + 100);
+    const paymentPromise = supabase.from("station_order_payment_status")
+      .select("order_id, payment_status")
+      .in("order_id", batch);
+    const itemPromise = includeItems
+      ? supabase.from("order_items")
+          .select("id, order_id, water_type_snapshot, container_type_snapshot, quantity")
+          .in("order_id", batch)
+          .order("created_at")
+          .order("id")
+          .range(0, pageSize - 1)
+      : Promise.resolve({ data: [], error: null });
+    const [{ data: itemData, error: itemError }, { data: paymentData, error: paymentError }] =
+      await Promise.all([itemPromise, paymentPromise]);
+    if (itemError) throw itemError;
+    if (paymentError) throw paymentError;
+    analyticsItems.push(...(itemData ?? []) as AnalyticsOrderItem[]);
+    const paymentStatusByOrder = new Map(
+      (paymentData ?? []).map((payment) => [payment.order_id, payment.payment_status]),
+    );
+    for (const order of analyticsOrders) {
+      if (batch.includes(order.id)) {
+        order.payment_status = paymentStatusByOrder.get(order.id) ?? null;
+      }
+    }
+    let itemOffset = pageSize;
+    if (includeItems && (itemData ?? []).length === pageSize) {
+      while (true) {
+        const { data, error } = await supabase.from("order_items")
+          .select("id, order_id, water_type_snapshot, container_type_snapshot, quantity")
+          .in("order_id", batch)
+          .order("created_at")
+          .order("id")
+          .range(itemOffset, itemOffset + pageSize - 1);
+        if (error) throw error;
+        const page = (data ?? []) as AnalyticsOrderItem[];
+        analyticsItems.push(...page);
+        if (page.length < pageSize) break;
+        itemOffset += pageSize;
+      }
+    }
+  }
+
+  return { orders: analyticsOrders, items: analyticsItems };
 }
 
 function useOnlineStatus() {
@@ -774,6 +982,12 @@ function SellerDashboard({
   const [station, setStation] = useState<Station | null>(null);
   const [products, setProducts] = useState<StationProduct[]>([]);
   const [orders, setOrders] = useState<StationOrder[]>([]);
+  const [analyticsOrders, setAnalyticsOrders] = useState<AnalyticsOrder[]>([]);
+  const [analyticsItems, setAnalyticsItems] = useState<AnalyticsOrderItem[]>([]);
+  const [previousAnalyticsOrders, setPreviousAnalyticsOrders] = useState<AnalyticsOrder[]>([]);
+  const initialAnalyticsRange = useMemo(() => getDefaultAnalyticsRange(), []);
+  const [analyticsStartDate, setAnalyticsStartDate] = useState(initialAnalyticsRange.startDate);
+  const [analyticsEndDate, setAnalyticsEndDate] = useState(initialAnalyticsRange.endDate);
   const [riders, setRiders] = useState<StationRider[]>([]);
   const [waterTypes, setWaterTypes] = useState<WaterType[]>([]);
   const [containerTypes, setContainerTypes] = useState<ContainerType[]>([]);
@@ -826,6 +1040,9 @@ function SellerDashboard({
         setStation(null);
         setProducts([]);
         setOrders([]);
+        setAnalyticsOrders([]);
+        setAnalyticsItems([]);
+        setPreviousAnalyticsOrders([]);
         setRiders([]);
         setDocuments([]);
         setRequirements([]);
@@ -858,7 +1075,18 @@ function SellerDashboard({
       setDocuments((documentsResult.data ?? []) as StationDocument[]);
 
       if (currentStation) {
-        const [productsResult, hoursResult, policiesResult, ordersResult, dismissalsResult, ridersResult] = await Promise.all([
+        const selectedRange = getAnalyticsRangeBounds(analyticsStartDate, analyticsEndDate);
+        const previousRange = getPreviousAnalyticsRange(analyticsStartDate, selectedRange.dayCount);
+        const [
+          productsResult,
+          hoursResult,
+          policiesResult,
+          ordersResult,
+          dismissalsResult,
+          ridersResult,
+          rangeAnalytics,
+          previousRangeAnalytics,
+        ] = await Promise.all([
           supabase.from("station_products")
             .select("id, station_id, water_type_id, container_type_id, name, description, refill_available, refill_price, new_container_available, new_container_price, deposit_amount, requires_empty_container, return_policy, stock_quantity, max_order_quantity, status, image_path, created_at")
             .eq("station_id", currentStation.id)
@@ -871,7 +1099,7 @@ function SellerDashboard({
             .select("container_type_id, is_active")
             .eq("station_id", currentStation.id),
           supabase.from("orders")
-            .select("id, order_number, status, payment_method, total, delivery_fee, address_snapshot, customer_notes, created_at")
+            .select("id, order_number, customer_id, status, payment_method, total, delivery_fee, address_snapshot, customer_notes, created_at, delivered_at, estimated_delivery_at")
             .eq("station_id", currentStation.id)
             .order("created_at", { ascending: false })
             .limit(100),
@@ -882,6 +1110,17 @@ function SellerDashboard({
             .select("id, station_id, rider_number, name, phone")
             .eq("station_id", currentStation.id)
             .order("rider_number"),
+          fetchAnalyticsRange(
+            currentStation.id,
+            selectedRange.start,
+            selectedRange.end,
+          ),
+          fetchAnalyticsRange(
+            currentStation.id,
+            previousRange.start,
+            previousRange.end,
+            false,
+          ),
         ]);
         if (productsResult.error) throw productsResult.error;
         if (hoursResult.error) throw hoursResult.error;
@@ -889,6 +1128,9 @@ function SellerDashboard({
         if (ordersResult.error) throw ordersResult.error;
         if (dismissalsResult.error) throw dismissalsResult.error;
         if (ridersResult.error) throw ridersResult.error;
+        setAnalyticsOrders(rangeAnalytics.orders);
+        setAnalyticsItems(rangeAnalytics.items);
+        setPreviousAnalyticsOrders(previousRangeAnalytics.orders);
         setRiders((ridersResult.data ?? []) as StationRider[]);
         const dismissedOrderIds = new Set((dismissalsResult.data ?? []).map((item) => item.order_id));
         const currentOrders = (ordersResult.data ?? []).filter((order) => !dismissedOrderIds.has(order.id));
@@ -980,6 +1222,9 @@ function SellerDashboard({
       } else {
         setProducts([]);
         setOrders([]);
+        setAnalyticsOrders([]);
+        setAnalyticsItems([]);
+        setPreviousAnalyticsOrders([]);
         setRiders([]);
         setOperatingHours([]);
         setContainerPolicies([]);
@@ -992,7 +1237,7 @@ function SellerDashboard({
       setLoading(false);
       setRefreshing(false);
     }
-  }, [onNotice, session.user.id]);
+  }, [analyticsEndDate, analyticsStartDate, onNotice, session.user.id]);
 
   const dismissOrder = useCallback(async (orderId: string) => {
     if (!supabase) {
@@ -1155,8 +1400,11 @@ function SellerDashboard({
     }
   }, [load, onNotice]);
 
+  const hasLoadedDashboard = useRef(false);
   useEffect(() => {
-    void load();
+    const showRefresh = hasLoadedDashboard.current;
+    hasLoadedDashboard.current = true;
+    void load(showRefresh);
   }, [load]);
 
   useEffect(() => {
@@ -1311,6 +1559,16 @@ function SellerDashboard({
                   station={station}
                   operatingHours={operatingHours}
                   products={products}
+                  orders={orders}
+                  analyticsOrders={analyticsOrders}
+                  analyticsItems={analyticsItems}
+                  previousAnalyticsOrders={previousAnalyticsOrders}
+                  analyticsStartDate={analyticsStartDate}
+                  analyticsEndDate={analyticsEndDate}
+                  onAnalyticsRangeChange={(startDate, endDate) => {
+                    setAnalyticsStartDate(startDate);
+                    setAnalyticsEndDate(endDate);
+                  }}
                   activeProducts={activeProducts}
                   lowStockProducts={lowStockProducts}
                   onNavigate={setSection}
@@ -1750,6 +2008,13 @@ function OverviewSection({
   station,
   operatingHours,
   products,
+  orders,
+  analyticsOrders,
+  analyticsItems,
+  previousAnalyticsOrders,
+  analyticsStartDate,
+  analyticsEndDate,
+  onAnalyticsRangeChange,
   activeProducts,
   lowStockProducts,
   onNavigate,
@@ -1762,6 +2027,13 @@ function OverviewSection({
   station: Station | null;
   operatingHours: StationOperatingHour[];
   products: StationProduct[];
+  orders: StationOrder[];
+  analyticsOrders: AnalyticsOrder[];
+  analyticsItems: AnalyticsOrderItem[];
+  previousAnalyticsOrders: AnalyticsOrder[];
+  analyticsStartDate: string;
+  analyticsEndDate: string;
+  onAnalyticsRangeChange: (startDate: string, endDate: string) => void;
   activeProducts: number;
   lowStockProducts: number;
   onNavigate: (section: PortalSection) => void;
@@ -1770,10 +2042,247 @@ function OverviewSection({
   onRefresh: () => void;
   onNotice: (notice: Notice | null) => void;
 }) {
+  const [draftStartDate, setDraftStartDate] = useState(analyticsStartDate);
+  const [draftEndDate, setDraftEndDate] = useState(analyticsEndDate);
+  const [rangeError, setRangeError] = useState<string | null>(null);
+  const maxAnalyticsDate = getManilaDateString();
+  useEffect(() => {
+    setDraftStartDate(analyticsStartDate);
+    setDraftEndDate(analyticsEndDate);
+    setRangeError(null);
+  }, [analyticsEndDate, analyticsStartDate]);
+  const selectedRange = getAnalyticsRangeBounds(analyticsStartDate, analyticsEndDate);
+  const previousRange = getPreviousAnalyticsRange(analyticsStartDate, selectedRange.dayCount);
+  const selectedRangeLabel = formatAnalyticsRange(analyticsStartDate, analyticsEndDate);
+  const selectedDates = Array.from({ length: selectedRange.dayCount }, (_, index) =>
+    addCalendarDays(analyticsStartDate, index)
+  );
+  const validAnalyticsOrders = analyticsOrders.filter((order) => !isCancelledOrder(order.status));
+  const paidOrders = validAnalyticsOrders.filter((order) => order.payment_status === "paid");
+  const previousPaidOrders = previousAnalyticsOrders.filter((order) =>
+    !isCancelledOrder(order.status) && order.payment_status === "paid"
+  );
+  const analyticsOrderById = new Map(analyticsOrders.map((order) => [order.id, order]));
+  const todayDate = getManilaDateString();
+  const todayOrders = orders.filter((order) => {
+    const { day, month, year } = getManilaDateParts(new Date(order.created_at));
+    return `${year}-${month}-${day}` === todayDate && !isCancelledOrder(order.status);
+  });
+  const todayPaidOrders = todayOrders.filter((order) => order.payment_status === "paid");
+  const todaySales = todayPaidOrders.reduce((total, order) => total + orderSalesAmount(order), 0);
+  const todayDay = selectedRange.dayCount;
+  const awaitingPaymentOrders = orders.filter((order) =>
+    !isCancelledOrder(order.status)
+    && ["pending", "processing"].includes(order.payment_status ?? "")
+  );
+  const dailySales = selectedDates.map((date, index) => ({
+    day: index + 1,
+    date,
+    sales: 0,
+  }));
+  for (const order of paidOrders) {
+    const { day, month, year } = getManilaDateParts(new Date(order.created_at));
+    const date = `${year}-${month}-${day}`;
+    const index = selectedDates.indexOf(date);
+    if (index >= 0) dailySales[index].sales += orderSalesAmount(order);
+  }
+  const rangeSales = paidOrders.reduce((total, order) => total + orderSalesAmount(order), 0);
+  const previousRangeSales = previousPaidOrders.reduce(
+    (total, order) => total + orderSalesAmount(order),
+    0,
+  );
+  const salesChangePercent = previousRangeSales > 0
+    ? ((rangeSales - previousRangeSales) / previousRangeSales) * 100
+    : null;
+  const waterTypeSales = new Map<string, number>();
+  for (const item of analyticsItems) {
+    const order = analyticsOrderById.get(item.order_id);
+    if (!order || isCancelledOrder(order.status)) continue;
+    const waterType = item.water_type_snapshot.trim() || "Other";
+    waterTypeSales.set(waterType, (waterTypeSales.get(waterType) ?? 0) + Number(item.quantity));
+  }
+  const topWaterTypes = [...waterTypeSales.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 5);
+  const topProductSizes = new Map<string, { waterType: string; containerType: string; quantity: number }>();
+  for (const item of analyticsItems) {
+    const order = analyticsOrderById.get(item.order_id);
+    if (!order || isCancelledOrder(order.status)) continue;
+    const waterType = item.water_type_snapshot.trim() || "Other";
+    const containerType = item.container_type_snapshot.trim() || "Gallon";
+    const key = `${waterType}\u0000${containerType}`;
+    const current = topProductSizes.get(key) ?? { waterType, containerType, quantity: 0 };
+    current.quantity += Number(item.quantity);
+    topProductSizes.set(key, current);
+  }
+  const rankedProductSizes = [...topProductSizes.values()]
+    .sort((left, right) => right.quantity - left.quantity)
+    .slice(0, 5);
+  const customerSales = new Map<string, { name: string; orders: number; sales: number }>();
+  for (const order of paidOrders) {
+    const customer = customerSales.get(order.customer_id) ?? {
+      name: orderCustomerName(order.address_snapshot, order.order_number),
+      orders: 0,
+      sales: 0,
+    };
+    customer.orders += 1;
+    customer.sales += orderSalesAmount(order);
+    customerSales.set(order.customer_id, customer);
+  }
+  const topCustomers = [...customerSales.values()]
+    .sort((left, right) => right.sales - left.sales)
+    .slice(0, 5);
+  const recentOrders = orders.slice(0, 5);
+  const deliveredOrders = validAnalyticsOrders.filter((order) =>
+    order.delivered_at && Number.isFinite(new Date(order.delivered_at).getTime())
+  );
+  const fulfillmentHours = deliveredOrders
+    .map((order) => (
+      new Date(order.delivered_at!).getTime() - new Date(order.created_at).getTime()
+    ) / 3_600_000)
+    .filter((hours) => hours >= 0);
+  const averageFulfillmentHours = fulfillmentHours.length > 0
+    ? fulfillmentHours.reduce((total, hours) => total + hours, 0) / fulfillmentHours.length
+    : null;
+  const lateOrders = orders.filter((order) =>
+    !["delivered", "cancelled", "canceled"].includes(order.status.toLowerCase())
+    && order.estimated_delivery_at !== null
+    && new Date(order.estimated_delivery_at).getTime() < Date.now()
+  );
+  const lowStockList = products
+    .filter((product) => product.status === "active" && product.stock_quantity !== null && product.stock_quantity <= 5)
+    .sort((left, right) => (left.stock_quantity ?? 0) - (right.stock_quantity ?? 0))
+    .slice(0, 4);
+  const dailyOrders = Array.from({ length: selectedRange.dayCount }, () => 0);
+  for (const order of validAnalyticsOrders) {
+    const { day, month, year } = getManilaDateParts(new Date(order.created_at));
+    const index = selectedDates.indexOf(`${year}-${month}-${day}`);
+    if (index >= 0) dailyOrders[index] += 1;
+  }
+  const salesDays = dailySales.map((item, index) => ({
+    day: item.day,
+    date: item.date,
+    sales: item.sales,
+    orders: dailyOrders[index],
+  }));
+  const applyAnalyticsRange = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!draftStartDate || !draftEndDate || draftStartDate > draftEndDate) {
+      setRangeError("Choose a valid start and end date.");
+      return;
+    }
+    if (draftEndDate > maxAnalyticsDate) {
+      setRangeError("The end date cannot be in the future.");
+      return;
+    }
+    const dayCount = Math.floor(
+      (new Date(`${draftEndDate}T00:00:00Z`).getTime()
+        - new Date(`${draftStartDate}T00:00:00Z`).getTime())
+        / 86_400_000,
+    ) + 1;
+    if (dayCount > 366) {
+      setRangeError("Choose a range of up to 366 days.");
+      return;
+    }
+    setRangeError(null);
+    onAnalyticsRangeChange(draftStartDate, draftEndDate);
+  };
+  const applyPreset = (startDate: string, endDate: string) => {
+    setDraftStartDate(startDate);
+    setDraftEndDate(endDate);
+    setRangeError(null);
+    onAnalyticsRangeChange(startDate, endDate);
+  };
+  const previousDailySales = Array.from({ length: selectedRange.dayCount }, () => 0);
+  for (const order of previousAnalyticsOrders) {
+    if (isCancelledOrder(order.status) || order.payment_status !== "paid") continue;
+    const { day, month, year } = getManilaDateParts(new Date(order.created_at));
+    const orderDate = `${year}-${month}-${day}`;
+    const index = Math.floor(
+      (new Date(`${orderDate}T00:00:00Z`).getTime()
+        - new Date(`${previousRange.start.slice(0, 10)}T00:00:00Z`).getTime())
+        / 86_400_000,
+    );
+    if (index >= 0 && index < previousDailySales.length) {
+      previousDailySales[index] += orderSalesAmount(order);
+    }
+  }
+  const salesDelta: KpiDelta | null = salesChangePercent === null
+    ? null
+    : {
+        text: `${salesChangePercent < 0 ? "−" : "+"}${Math.abs(salesChangePercent).toFixed(1)}%`,
+        direction: salesChangePercent > 0.05 ? "up" : salesChangePercent < -0.05 ? "down" : "flat",
+      };
+
+  const totalWaterUnits = [...waterTypeSales.values()].reduce((total, quantity) => total + quantity, 0);
+  const unitsLabel = (quantity: number) => `${quantity} unit${quantity === 1 ? "" : "s"}`;
+  const waterTypeItems: RankItem[] = topWaterTypes.map(([name, quantity]) => ({
+    key: name,
+    label: name,
+    value: quantity,
+    valueLabel: unitsLabel(quantity),
+    share: totalWaterUnits > 0 ? quantity / totalWaterUnits : undefined,
+  }));
+  const sizeItems: RankItem[] = rankedProductSizes.map((product) => ({
+    key: `${product.waterType}-${product.containerType}`,
+    label: product.waterType,
+    sub: product.containerType,
+    value: product.quantity,
+    valueLabel: unitsLabel(product.quantity),
+    share: totalWaterUnits > 0 ? product.quantity / totalWaterUnits : undefined,
+  }));
+  const customerItems: RankItem[] = topCustomers.map((customer, index) => ({
+    key: `${customer.name}-${index}`,
+    label: customer.name,
+    sub: `${customer.orders} order${customer.orders === 1 ? "" : "s"}`,
+    value: customer.sales,
+    valueLabel: money(customer.sales),
+    share: rangeSales > 0 ? customer.sales / rangeSales : undefined,
+  }));
+
+  const weekdayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const weekdayFormat = new Intl.DateTimeFormat("en-US", { weekday: "short", timeZone: "Asia/Manila" });
+  const weekdayCounts = weekdayNames.map(() => 0);
+  for (const order of validAnalyticsOrders) {
+    const index = weekdayNames.indexOf(weekdayFormat.format(new Date(order.created_at)));
+    if (index >= 0) weekdayCounts[index] += 1;
+  }
+  const peakWeekdayCount = Math.max(...weekdayCounts, 0);
+  const weekdayItems: ColumnItem[] = weekdayNames.map((name, index) => ({
+    key: name,
+    label: name,
+    value: weekdayCounts[index],
+    valueLabel: String(weekdayCounts[index]),
+    detail: `order${weekdayCounts[index] === 1 ? "" : "s"} placed on ${name}s`,
+    emphasis: peakWeekdayCount > 0 && weekdayCounts[index] === peakWeekdayCount,
+  }));
+
+  const deliveryBuckets = [
+    { label: "<1h", under: 1 },
+    { label: "1–2h", under: 2 },
+    { label: "2–4h", under: 4 },
+    { label: "4–8h", under: 8 },
+    { label: "8–24h", under: 24 },
+    { label: "24h+", under: Infinity },
+  ];
+  const deliveryCounts = deliveryBuckets.map(() => 0);
+  for (const hours of fulfillmentHours) {
+    const index = deliveryBuckets.findIndex((bucket) => hours < bucket.under);
+    deliveryCounts[index] += 1;
+  }
+  const peakDeliveryCount = Math.max(...deliveryCounts, 0);
+  const deliveryTimeItems: ColumnItem[] = deliveryBuckets.map((bucket, index) => ({
+    key: bucket.label,
+    label: bucket.label,
+    value: deliveryCounts[index],
+    valueLabel: String(deliveryCounts[index]),
+    detail: `delivered order${deliveryCounts[index] === 1 ? "" : "s"} took ${bucket.label}`,
+    emphasis: peakDeliveryCount > 0 && deliveryCounts[index] === peakDeliveryCount,
+  }));
   const status = station?.publication_status === "published"
     ? "Live for customers"
     : readable(application.application_status);
-  const statusTone = station?.publication_status === "published" ? "green" : "blue";
+  const stationStatusTone = station?.publication_status === "published" ? "green" : "blue";
   const draftCount = products.filter((product) => product.status !== "active").length;
   const deliveryConfigured = station?.service_radius_km !== null
     && station?.service_radius_km !== undefined
@@ -1799,7 +2308,7 @@ function OverviewSection({
         }
       />
       <div className="status-banner">
-        <span className={`status-orb ${statusTone}`}><Store size={17} /></span>
+        <span className={`status-orb ${stationStatusTone}`}><Store size={17} /></span>
         <div className="status-copy">
           <strong>{station?.publication_status === "published" ? "Your station is visible to customers" : "Your station is not public yet"}</strong>
           <span>
@@ -1808,8 +2317,253 @@ function OverviewSection({
               : "Complete required documents and wait for verification and publication before customers can find your listings."}
           </span>
         </div>
-        <span className={`pill pill-${statusTone}`}>{status}</span>
+        <span className={`pill pill-${stationStatusTone}`}>{status}</span>
       </div>
+      <section className="seller-analytics" aria-label="Sales analytics">
+        <div className="analytics-title">
+          <div>
+            <h2>Sales analytics</h2>
+            <p>Paid sales for {selectedRangeLabel}, excluding delivery fees and cancelled orders.</p>
+          </div>
+        </div>
+        <form className="analytics-range-picker" onSubmit={applyAnalyticsRange}>
+          <div className="analytics-range-inputs">
+            <label>
+              <span>From</span>
+              <input
+                type="date"
+                value={draftStartDate}
+                max={draftEndDate || maxAnalyticsDate}
+                onChange={(event) => setDraftStartDate(event.target.value)}
+                aria-label="Analytics start date"
+              />
+            </label>
+            <span className="analytics-range-separator" aria-hidden="true">to</span>
+            <label>
+              <span>To</span>
+              <input
+                type="date"
+                value={draftEndDate}
+                min={draftStartDate}
+                max={maxAnalyticsDate}
+                onChange={(event) => setDraftEndDate(event.target.value)}
+                aria-label="Analytics end date"
+              />
+            </label>
+            <button className="button button-primary button-small" type="submit">
+              <CalendarDays size={15} /> Apply range
+            </button>
+          </div>
+          <div className="analytics-range-bottom">
+            <div className="analytics-range-presets" aria-label="Quick date ranges">
+              <button type="button" onClick={() => applyPreset(addCalendarDays(maxAnalyticsDate, -6), maxAnalyticsDate)}>Last 7 days</button>
+              <button type="button" onClick={() => applyPreset(addCalendarDays(maxAnalyticsDate, -29), maxAnalyticsDate)}>Last 30 days</button>
+              <button
+                type="button"
+                onClick={() => applyPreset(`${maxAnalyticsDate.slice(0, 7)}-01`, maxAnalyticsDate)}
+              >This month</button>
+            </div>
+            <span className="analytics-range-hint">Up to 366 days · compares with the previous equal-length period</span>
+          </div>
+          {rangeError && <p className="analytics-range-error" role="alert">{rangeError}</p>}
+        </form>
+        <SectionNav items={analyticsSections} />
+
+        <div className="viz-kpis">
+          <KpiTile
+            hero
+            label="Paid sales in range"
+            icon={<Wallet size={16} />}
+            tone="green"
+            value={<CountUp value={rangeSales} format={moneyWhole} />}
+            delta={salesDelta}
+            caption={salesChangePercent === null
+              ? "No paid sales in the previous equal-length period"
+              : "vs previous equal-length period"}
+            spark={dailySales.map((item) => item.sales)}
+            sparkLabel={`Daily paid sales, ${selectedRangeLabel}`}
+          />
+          <KpiTile
+            label="Today's paid sales"
+            icon={<Wallet size={16} />}
+            tone="green"
+            value={<CountUp value={todaySales} format={moneyWhole} />}
+            caption={`from ${todayPaidOrders.length} paid order${todayPaidOrders.length === 1 ? "" : "s"} placed today`}
+          />
+          <KpiTile
+            label="Orders today"
+            icon={<ShoppingBag size={16} />}
+            tone="blue"
+            value={<CountUp value={todayOrders.length} format={wholeNumber} duration={600} />}
+            caption="excluding cancelled orders"
+            spark={dailyOrders}
+            sparkLabel={`Orders placed per day, ${selectedRangeLabel}`}
+          />
+          <KpiTile
+            label="Awaiting payment"
+            icon={<Clock3 size={16} />}
+            tone={awaitingPaymentOrders.length > 0 ? "amber" : "green"}
+            value={<CountUp value={awaitingPaymentOrders.length} format={wholeNumber} duration={600} />}
+            caption="among your latest 100 orders"
+            action={awaitingPaymentOrders.length > 0 ? (
+              <button className="text-link" type="button" onClick={() => onNavigate("orders")}>
+                Review <ArrowRight size={14} />
+              </button>
+            ) : undefined}
+          />
+        </div>
+
+        <div id="an-sales" className="viz-group">
+          <SalesTrendChart
+            days={salesDays}
+            previousDaily={previousDailySales}
+            todayDay={todayDay}
+            rangeLabel={selectedRangeLabel}
+            previousRangeLabel={formatAnalyticsRange(
+              addCalendarDays(analyticsStartDate, -selectedRange.dayCount),
+              addCalendarDays(analyticsStartDate, -1),
+            )}
+            previousStartDate={addCalendarDays(analyticsStartDate, -selectedRange.dayCount)}
+            paidOrderCount={paidOrders.length}
+            formatMoney={money}
+            formatAxis={moneyCompact}
+          />
+        </div>
+
+        <div id="an-products" className="viz-group">
+          <div className="viz-group-head">
+            <h3>Products and customers</h3>
+            <p>What sells, when it sells, and who buys</p>
+          </div>
+          <div className="viz-pair">
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Most sold water type</h2><p>Units ordered in selected range, with share of all units</p></div>
+                <Droplets size={19} className="heading-icon" />
+              </div>
+              <RankBars items={waterTypeItems} emptyText="No water type sales in this range." />
+            </section>
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Popular product sizes</h2><p>Water type and gallon size combinations</p></div>
+                <Package size={19} className="heading-icon" />
+              </div>
+              <RankBars items={sizeItems} emptyText="Product rankings will appear when customers order." />
+            </section>
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Orders by weekday</h2><p>When customers order most in this range</p></div>
+                <ShoppingBag size={19} className="heading-icon" />
+              </div>
+              {validAnalyticsOrders.length === 0 ? (
+                <p className="analytics-empty">Weekday patterns will appear when orders come in.</p>
+              ) : (
+                <MiniColumns items={weekdayItems} ariaLabel={`Orders placed per weekday, ${selectedRangeLabel}`} />
+              )}
+            </section>
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Best customers</h2><p>Paid sales in selected range, with share of total</p></div>
+                <Users size={19} className="heading-icon" />
+              </div>
+              <RankBars items={customerItems} emptyText="Customer rankings will appear when orders come in." />
+            </section>
+          </div>
+        </div>
+
+        <div id="an-delivery" className="viz-group">
+          <div className="viz-group-head">
+            <h3>Delivery and stock</h3>
+            <p>How fast orders arrive and what needs restocking</p>
+          </div>
+          <div className="viz-pair">
+            <section className="panel">
+              <div className="panel-heading">
+                <div><h2>Delivery performance</h2><p>Fulfillment time and overdue orders</p></div>
+                <Truck size={19} className="heading-icon" />
+              </div>
+              <div className="viz-metrics">
+                <div>
+                  <span>Average time to deliver</span>
+                  <strong>{averageFulfillmentHours === null ? "—" : `${averageFulfillmentHours.toFixed(1)} hr`}</strong>
+                  <small>from order placed to delivered in selected range</small>
+                </div>
+                <div className={lateOrders.length > 0 ? "is-late" : ""}>
+                  <span>Past estimated delivery</span>
+                  <strong>{lateOrders.length}</strong>
+                  <small>among your latest 100 orders</small>
+                </div>
+              </div>
+              {fulfillmentHours.length === 0 ? (
+                <p className="analytics-empty">Delivery times will appear after a delivered order in this range.</p>
+              ) : (
+                <>
+                  <p className="viz-subtitle">Delivered orders by time taken</p>
+                  <MiniColumns items={deliveryTimeItems} ariaLabel="Delivered orders grouped by delivery time" height={120} />
+                </>
+              )}
+              {lateOrders.length > 0 && (
+                <button className="text-link fulfillment-orders-link" type="button" onClick={() => onNavigate("orders")}>
+                  Review overdue orders <ArrowRight size={15} />
+                </button>
+              )}
+            </section>
+            <section className="panel stock-watch-panel">
+              <div className="panel-heading">
+                <div><h2>Stock watch</h2><p>Active products with five or fewer units</p></div>
+                <CircleAlert size={19} className="heading-icon" />
+              </div>
+              {lowStockList.length === 0 ? (
+                <p className="analytics-empty">No active products need restocking right now.</p>
+              ) : (
+                <div className="stock-watch-list">
+                  {lowStockList.map((product) => (
+                    <div className="stock-watch-row" key={product.id}>
+                      <span className="stock-watch-quantity">{product.stock_quantity}</span>
+                      <strong>{product.name}</strong>
+                      <button className="button button-secondary button-small" type="button" onClick={() => onStock(product)}>
+                        Update stock
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </div>
+
+        <div id="an-orders" className="viz-group">
+          <div className="viz-group-head">
+            <h3>Recent activity</h3>
+            <p>Your latest customer orders</p>
+          </div>
+          <section className="panel recent-orders-panel">
+            <div className="panel-heading">
+              <div><h2>Recent orders</h2><p>Your latest customer activity</p></div>
+              <button className="text-link" type="button" onClick={() => onNavigate("orders")}>
+                View all <ArrowRight size={15} />
+              </button>
+            </div>
+            {recentOrders.length === 0 ? (
+              <div className="analytics-empty">New orders will show up here.</div>
+            ) : (
+              <div className="analytics-recent-list">
+                {recentOrders.map((order) => (
+                  <div className="analytics-recent-order" key={order.id}>
+                    <span className="analytics-recent-icon"><ShoppingBag size={16} /></span>
+                    <div className="analytics-recent-copy">
+                      <strong>Order #{order.order_number}</strong>
+                      <span>{orderCustomerName(order.address_snapshot, order.order_number)} · {timeAgo(order.created_at)}</span>
+                    </div>
+                    <span className={`pill pill-${statusTone(order.status)}`}>{readable(order.status)}</span>
+                    <strong className="analytics-recent-total">{money(order.total)}</strong>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+      </section>
       <div className="stats-grid">
         <StatCard icon={<Package size={18} />} label="Water options" value={products.length} tone="blue" />
         <StatCard icon={<BadgeCheck size={18} />} label="Active water options" value={activeProducts} tone="green" />
@@ -2863,6 +3617,9 @@ function StationOrdersSection({
           onDismiss={() => onDismissOrder(selectedOrder.id)}
           onUpdateStatus={(status) => onUpdateOrderStatus(selectedOrder, status)}
           onCancel={() => onCancelOrder(selectedOrder)}
+          riders={riders}
+          onAssignRider={(riderId) => onAssignRider(selectedOrder, riderId)}
+          onManageRiders={onManageRiders}
         />
       )}
     </>
@@ -2877,6 +3634,9 @@ function StationOrderDetailDrawer({
   onDismiss,
   onUpdateStatus,
   onCancel,
+  riders,
+  onAssignRider,
+  onManageRiders,
 }: {
   order: StationOrder;
   dismissing: boolean;
@@ -2885,7 +3645,12 @@ function StationOrderDetailDrawer({
   onDismiss: () => void;
   onUpdateStatus: (status: string) => void;
   onCancel: () => void;
+  riders: StationRider[];
+  onAssignRider: (riderId: string) => Promise<boolean>;
+  onManageRiders: () => void;
 }) {
+  const [showRiderPicker, setShowRiderPicker] = useState(false);
+  const [selectedRiderId, setSelectedRiderId] = useState("");
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -3019,8 +3784,77 @@ function StationOrderDetailDrawer({
             <div className="station-order-detail-actions">
               {canDismiss && <button className="button button-secondary button-small" type="button" disabled={dismissing} onClick={onDismiss}>{dismissing ? <span className="spinner" /> : <Trash2 size={14} />} Hide order</button>}
               {canCancel && <button className="button button-secondary button-small station-order-cancel" type="button" disabled={updating} onClick={onCancel}>{updating ? <span className="spinner" /> : <X size={14} />} Cancel order</button>}
-              {next && <button className="button button-primary button-small" type="button" disabled={updating || waitingForPayment || riderNotAssigned} title={waitingForPayment ? "Wait until PayMongo payment is received before confirming." : riderNotAssigned ? "Assign a rider before marking the order out for delivery." : undefined} onClick={() => onUpdateStatus(next.status)}>{updating ? <span className="spinner spinner-light" /> : <Check size={14} />} {waitingForPayment && order.status === "pending" ? "Waiting for payment" : next.label}</button>}
+              {next && (
+                riderNotAssigned ? (
+                  <button
+                    className="button button-primary button-small"
+                    type="button"
+                    onClick={() => setShowRiderPicker((visible) => !visible)}
+                    aria-expanded={showRiderPicker}
+                    aria-controls="station-order-rider-picker"
+                  >
+                    <Truck size={14} /> Assign rider
+                  </button>
+                ) : (
+                  <button
+                    className="button button-primary button-small"
+                    type="button"
+                    disabled={updating || waitingForPayment}
+                    title={waitingForPayment ? "Wait until PayMongo payment is received before confirming." : undefined}
+                    onClick={() => onUpdateStatus(next.status)}
+                  >
+                    {updating ? <span className="spinner spinner-light" /> : <Check size={14} />}
+                    {waitingForPayment && order.status === "pending" ? "Waiting for payment" : next.label}
+                  </button>
+                )
+              )}
             </div>
+            {showRiderPicker && (
+              <div className="station-order-rider-picker station-order-detail-rider-picker" id="station-order-rider-picker">
+                {riders.length === 0 ? (
+                  <p>No riders added yet. <button type="button" onClick={onManageRiders}>Manage riders</button></p>
+                ) : (
+                  <>
+                    <label>
+                      <span className="sr-only">Choose a delivery rider for order {order.order_number}</span>
+                      <select value={selectedRiderId} onChange={(event) => setSelectedRiderId(event.target.value)}>
+                        <option value="">Select a rider</option>
+                        {riders.map((rider) => (
+                          <option key={rider.id} value={rider.id}>
+                            Rider {String(rider.rider_number).padStart(2, "0")} · {rider.name} · {rider.phone}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      className="button button-primary button-small"
+                      type="button"
+                      disabled={!selectedRiderId || updating}
+                      onClick={() => {
+                        void onAssignRider(selectedRiderId).then((assigned) => {
+                          if (assigned) {
+                            setShowRiderPicker(false);
+                            setSelectedRiderId("");
+                          }
+                        });
+                      }}
+                    >
+                      {updating ? <span className="spinner spinner-light" /> : <Check size={14} />} Assign
+                    </button>
+                    <button
+                      className="button button-secondary button-small"
+                      type="button"
+                      onClick={() => {
+                        setShowRiderPicker(false);
+                        setSelectedRiderId("");
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </footer>
         )}
       </section>
