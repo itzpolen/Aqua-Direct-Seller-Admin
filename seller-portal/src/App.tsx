@@ -66,6 +66,8 @@ type PortalSection = "overview" | "orders" | "products" | "delivery" | "riders" 
 interface Notice {
   kind: "success" | "error";
   text: string;
+  action?: { label: string; onClick: () => void };
+  duration?: number;
 }
 
 interface PsgcDivision {
@@ -123,15 +125,6 @@ interface AnalyticsOrderItem {
   quantity: number;
 }
 
-const nextOrderStatus: Record<string, { status: string; label: string }> = {
-  pending: { status: "confirmed", label: "Confirm order" },
-  confirmed: { status: "preparing", label: "Start preparing" },
-  preparing: { status: "ready", label: "Mark ready" },
-  ready: { status: "out_for_delivery", label: "Mark out for delivery" },
-  rider_assigned: { status: "out_for_delivery", label: "Mark out for delivery" },
-  out_for_delivery: { status: "delivered", label: "Mark delivered" },
-};
-
 const PSGC_API = "https://psgc.gitlab.io/api";
 
 async function fetchPsgcDivisions(path: string, signal: AbortSignal): Promise<PsgcDivision[]> {
@@ -156,6 +149,17 @@ async function fetchPsgcDivisions(path: string, signal: AbortSignal): Promise<Ps
     throw new Error("Administrative address data was returned in an unexpected format.");
   }
   return data;
+}
+
+function orderUpdateMessage(orderNumber: number, status: string) {
+  const outcome: Record<string, string> = {
+    confirmed: "confirmed",
+    preparing: "is being prepared",
+    ready: "is ready",
+    out_for_delivery: "is out for delivery",
+    delivered: "was delivered",
+  };
+  return `Order #${orderNumber} ${outcome[status] ?? `is now ${readable(status).toLowerCase()}`}`;
 }
 
 const money = (value: number | null | undefined) =>
@@ -1000,7 +1004,9 @@ function SellerDashboard({
   }>>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [dismissingOrderId, setDismissingOrderId] = useState<string | null>(null);
+  const [hiddenOrderIds, setHiddenOrderIds] = useState<Set<string>>(new Set());
+  const [restoredOrderId, setRestoredOrderId] = useState<string | null>(null);
+  const pendingHides = useRef(new Map<string, number>());
   const [updatingOrderId, setUpdatingOrderId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [stockEditor, setStockEditor] = useState<StationProduct | null>(null);
@@ -1239,36 +1245,78 @@ function SellerDashboard({
     }
   }, [analyticsEndDate, analyticsStartDate, onNotice, session.user.id]);
 
-  const dismissOrder = useCallback(async (orderId: string) => {
-    if (!supabase) {
-      onNotice({ kind: "error", text: "Supabase is not configured. The order could not be hidden." });
+  const unhideLocally = useCallback((orderId: string) => {
+    setHiddenOrderIds((current) => {
+      const next = new Set(current);
+      next.delete(orderId);
+      return next;
+    });
+  }, []);
+
+  const commitHide = useCallback(async (orderId: string) => {
+    pendingHides.current.delete(orderId);
+    if (!supabase) return;
+    const { error } = await supabase.from("station_order_dismissals").insert({
+      user_id: session.user.id,
+      order_id: orderId,
+    });
+    if (error) {
+      unhideLocally(orderId);
+      onNotice({ kind: "error", text: "Couldn't hide that order, so it's back in your list." });
       return;
     }
+    setOrders((current) => current.filter((order) => order.id !== orderId));
+    unhideLocally(orderId);
+  }, [onNotice, session.user.id, unhideLocally]);
+  const commitHideRef = useRef(commitHide);
+  commitHideRef.current = commitHide;
+
+  const undoHide = useCallback((orderId: string) => {
+    const timer = pendingHides.current.get(orderId);
+    if (timer === undefined) return;
+    window.clearTimeout(timer);
+    pendingHides.current.delete(orderId);
+    unhideLocally(orderId);
+    setRestoredOrderId(orderId);
+    window.setTimeout(() => setRestoredOrderId((current) => (current === orderId ? null : current)), 700);
+  }, [unhideLocally]);
+
+  // Hiding is applied after a short undo window; flush anything pending if the page closes.
+  useEffect(() => {
+    const pending = pendingHides.current;
+    const flush = () => {
+      for (const [orderId, timer] of [...pending]) {
+        window.clearTimeout(timer);
+        void commitHideRef.current(orderId);
+      }
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, []);
+
+  const dismissOrder = useCallback((orderId: string) => {
     const order = orders.find((item) => item.id === orderId);
     if (!order || !["delivered", "cancelled"].includes(order.status)) {
       onNotice({ kind: "error", text: "Only delivered or cancelled orders can be hidden." });
       return;
     }
-    if (!window.confirm("Hide this order from your Station orders list? The order and its payment history will remain in Supabase.")) return;
+    setHiddenOrderIds((current) => new Set(current).add(orderId));
+    pendingHides.current.set(orderId, window.setTimeout(() => void commitHide(orderId), 5600));
+    onNotice({
+      kind: "success",
+      text: `Order #${order.order_number} hidden`,
+      duration: 5000,
+      action: { label: "Undo", onClick: () => undoHide(orderId) },
+    });
+  }, [commitHide, onNotice, orders, undoHide]);
 
-    setDismissingOrderId(orderId);
-    try {
-      const { error } = await supabase.from("station_order_dismissals").insert({
-        user_id: session.user.id,
-        order_id: orderId,
-      });
-      if (error) throw error;
-      setOrders((current) => current.filter((order) => order.id !== orderId));
-      onNotice({ kind: "success", text: "Order hidden from your list. Its order and payment records were retained." });
-    } catch (error) {
-      onNotice({
-        kind: "error",
-        text: error instanceof Error ? error.message : "The order could not be hidden.",
-      });
-    } finally {
-      setDismissingOrderId(null);
-    }
-  }, [onNotice, orders, session.user.id]);
+  const visibleOrders = useMemo(
+    () => orders.filter((order) => !hiddenOrderIds.has(order.id)),
+    [hiddenOrderIds, orders],
+  );
 
   const updateOrderStatus = useCallback(async (order: StationOrder, status: string) => {
     if (!supabase) {
@@ -1283,7 +1331,7 @@ function SellerDashboard({
         p_status: status,
       });
       if (error) throw error;
-      onNotice({ kind: "success", text: `Order #${order.order_number} updated to ${readable(status)}.` });
+      onNotice({ kind: "success", text: orderUpdateMessage(order.order_number, status) });
       await load(true);
     } catch (error) {
       onNotice({
@@ -1295,13 +1343,11 @@ function SellerDashboard({
     }
   }, [load, onNotice]);
 
-  const cancelStationOrder = useCallback(async (order: StationOrder) => {
+  const cancelStationOrder = useCallback(async (order: StationOrder, reason: string): Promise<boolean> => {
     if (!supabase) {
       onNotice({ kind: "error", text: "Supabase is not configured. The order could not be cancelled." });
-      return;
+      return false;
     }
-    const reason = window.prompt(`Enter a cancellation reason for order #${order.order_number}:`)?.trim();
-    if (!reason) return;
     setUpdatingOrderId(order.id);
     onNotice(null);
     try {
@@ -1310,13 +1356,15 @@ function SellerDashboard({
         p_reason: reason,
       });
       if (error) throw error;
-      onNotice({ kind: "success", text: `Order #${order.order_number} was cancelled.` });
+      onNotice({ kind: "success", text: `Order #${order.order_number} cancelled` });
       await load(true);
+      return true;
     } catch (error) {
       onNotice({
         kind: "error",
         text: error instanceof Error ? error.message : "The order could not be cancelled.",
       });
+      return false;
     } finally {
       setUpdatingOrderId(null);
     }
@@ -1386,7 +1434,7 @@ function SellerDashboard({
         p_rider_id: riderId,
       });
       if (error) throw error;
-      onNotice({ kind: "success", text: `Rider assigned to order #${order.order_number}.` });
+      onNotice({ kind: "success", text: `Rider assigned to order #${order.order_number}` });
       await load(true);
       return true;
     } catch (error) {
@@ -1580,15 +1628,15 @@ function SellerDashboard({
               )}
               {section === "orders" && (
                 <StationOrdersSection
-                  orders={orders}
+                  orders={visibleOrders}
                   stationName={station?.display_name ?? application.display_name}
                   onRefresh={() => void load(true)}
                   refreshing={refreshing}
-                  dismissingOrderId={dismissingOrderId}
-                  onDismissOrder={(orderId) => void dismissOrder(orderId)}
+                  restoredOrderId={restoredOrderId}
+                  onDismissOrder={dismissOrder}
                   updatingOrderId={updatingOrderId}
                   onUpdateOrderStatus={(order, status) => void updateOrderStatus(order, status)}
-                  onCancelOrder={(order) => void cancelStationOrder(order)}
+                  onCancelOrder={cancelStationOrder}
                   riders={riders}
                   onAssignRider={assignRider}
                   onManageRiders={() => setSection("riders")}
@@ -3394,13 +3442,200 @@ function DeliveryRidersSection({
   );
 }
 
+type OrderFilter = "active" | "completed" | "cancelled" | "all";
+
+const orderFilterOptions: Array<{ value: OrderFilter; label: string }> = [
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
+  { value: "cancelled", label: "Cancelled" },
+  { value: "all", label: "All" },
+];
+
+const cancelReasons = [
+  "Customer asked to cancel",
+  "Out of stock",
+  "Can't reach the customer",
+  "Outside our delivery area",
+];
+
+function orderBucket(order: StationOrder): Exclude<OrderFilter, "all"> {
+  if (order.status === "delivered") return "completed";
+  if (order.status === "cancelled") return "cancelled";
+  return "active";
+}
+
+const orderHasRider = (order: StationOrder) => Boolean(order.rider_name && order.rider_phone);
+
+function riderLabelFor(order: StationOrder) {
+  const number = order.rider_number === null ? "" : `Rider ${String(order.rider_number).padStart(2, "0")}`;
+  return [number, order.rider_name].filter(Boolean).join(" · ") || "Your rider";
+}
+
+function initialsOf(name: string) {
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("") || "R";
+}
+
+function orderItemsSummary(order: StationOrder) {
+  if (order.items.length === 0) return "Items not available";
+  const first = `${order.items[0].quantity}× ${order.items[0].product_name_snapshot}`;
+  return order.items.length > 1 ? `${first} +${order.items.length - 1} more` : first;
+}
+
+interface OrderStep {
+  title: string;
+  description: string;
+  label: string;
+  status: string | null;
+  needsRider: boolean;
+  waiting: boolean;
+}
+
+/** What the station admin should do next for an order, in plain words. */
+function getOrderStep(order: StationOrder): OrderStep | null {
+  const waiting = order.payment_method === "paymongo" && order.payment_status !== "paid";
+  const hasRider = orderHasRider(order);
+  switch (order.status) {
+    case "pending":
+      return waiting
+        ? { title: "Waiting for payment", description: "You can confirm this order as soon as PayMongo confirms the payment.", label: "Confirm order", status: "confirmed", needsRider: false, waiting }
+        : { title: "Confirm this order", description: "Check the items and delivery address, then confirm so the customer knows you have it.", label: "Confirm order", status: "confirmed", needsRider: false, waiting };
+    case "confirmed":
+      return { title: "Start preparing", description: "Fill and pack the containers for this order.", label: "Start preparing", status: "preparing", needsRider: false, waiting };
+    case "preparing":
+      return { title: "Mark it ready", description: "Once everything is packed and waiting to go out, mark it ready.", label: "Mark ready", status: "ready", needsRider: false, waiting };
+    case "ready":
+    case "rider_assigned":
+      return hasRider
+        ? { title: "Start the delivery", description: `${riderLabelFor(order)} will deliver this order. Start the delivery when they leave your station.`, label: "Start delivery", status: "out_for_delivery", needsRider: false, waiting }
+        : { title: "Assign a rider", description: "Choose who will deliver this order. You'll start the delivery right after.", label: "Assign rider", status: null, needsRider: true, waiting };
+    case "out_for_delivery":
+      return {
+        title: "On the way",
+        description: order.payment_method === "cod"
+          ? `Collect ${money(order.total)} in cash on delivery, then mark it delivered.`
+          : "Mark it delivered once the customer has received the order.",
+        label: "Mark delivered", status: "delivered", needsRider: false, waiting,
+      };
+    default:
+      return null;
+  }
+}
+
+function RiderPicker({
+  riders,
+  selectedId,
+  onSelect,
+  onManageRiders,
+}: {
+  riders: StationRider[];
+  selectedId: string;
+  onSelect: (riderId: string) => void;
+  onManageRiders: () => void;
+}) {
+  if (riders.length === 0) {
+    return (
+      <div className="so-rider-empty">
+        <span><Truck size={18} /></span>
+        <div>
+          <strong>No riders yet</strong>
+          <p>Add a rider first, then come back to assign this order.</p>
+        </div>
+        <button className="button button-secondary button-small" type="button" onClick={onManageRiders}>Add a rider</button>
+      </div>
+    );
+  }
+  return (
+    <div className="so-rider-list" role="radiogroup" aria-label="Choose a delivery rider">
+      {riders.map((rider) => (
+        <label className={`so-rider ${selectedId === rider.id ? "is-selected" : ""}`} key={rider.id}>
+          <input type="radio" name="station-order-rider" value={rider.id} checked={selectedId === rider.id} onChange={() => onSelect(rider.id)} />
+          <span className="so-rider-avatar">{initialsOf(rider.name)}</span>
+          <span className="so-rider-info">
+            <strong>{rider.name}</strong>
+            <small>Rider {String(rider.rider_number).padStart(2, "0")} · {rider.phone}</small>
+          </span>
+          <span className="so-rider-check"><Check size={14} strokeWidth={3} /></span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function CancelOrderDialog({
+  order,
+  busy,
+  onConfirm,
+  onClose,
+}: {
+  order: StationOrder;
+  busy: boolean;
+  onConfirm: (reason: string) => void;
+  onClose: () => void;
+}) {
+  const [choice, setChoice] = useState<string>("");
+  const [other, setOther] = useState("");
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") closeRef.current(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  const reason = choice === "other" ? other.trim() : choice;
+  return (
+    <div className="modal-backdrop so-above" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="modal so-cancel" role="dialog" aria-modal="true" aria-label={`Cancel order ${order.order_number}`}>
+        <header className="modal-header">
+          <h2>Cancel order #{order.order_number}?</h2>
+          <button className="icon-button" type="button" aria-label="Close" onClick={onClose}><X size={18} /></button>
+        </header>
+        <div className="so-cancel-body">
+          <p>Pick a reason. It is saved with the cancellation, and the customer is told the order was cancelled.</p>
+          <div className="so-reasons" role="radiogroup" aria-label="Cancellation reason">
+            {[...cancelReasons, "other"].map((item) => (
+              <button
+                key={item}
+                type="button"
+                role="radio"
+                aria-checked={choice === item}
+                className={`so-reason ${choice === item ? "is-selected" : ""}`}
+                onClick={() => setChoice(item)}
+              >
+                {item === "other" ? "Something else" : item}
+              </button>
+            ))}
+          </div>
+          {choice === "other" && (
+            <textarea
+              className="so-reason-text"
+              rows={3}
+              maxLength={240}
+              autoFocus
+              value={other}
+              onChange={(event) => setOther(event.target.value)}
+              placeholder="Tell us what happened"
+              aria-label="Cancellation reason"
+            />
+          )}
+        </div>
+        <footer className="so-cancel-actions">
+          <button className="button button-secondary" type="button" onClick={onClose} disabled={busy}>Keep order</button>
+          <button className="button so-danger" type="button" disabled={!reason || busy} onClick={() => onConfirm(reason)}>
+            {busy ? <span className="spinner spinner-light" /> : <X size={15} />} Cancel order
+          </button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 function StationOrdersSection({
   orders,
   stationName,
   riders,
   onRefresh,
   refreshing,
-  dismissingOrderId,
+  restoredOrderId,
   onDismissOrder,
   updatingOrderId,
   onUpdateOrderStatus,
@@ -3413,193 +3648,153 @@ function StationOrdersSection({
   riders: StationRider[];
   onRefresh: () => void;
   refreshing: boolean;
-  dismissingOrderId: string | null;
+  restoredOrderId: string | null;
   onDismissOrder: (orderId: string) => void;
   updatingOrderId: string | null;
   onUpdateOrderStatus: (order: StationOrder, status: string) => void;
-  onCancelOrder: (order: StationOrder) => void;
+  onCancelOrder: (order: StationOrder, reason: string) => Promise<boolean>;
   onAssignRider: (order: StationOrder, riderId: string) => Promise<boolean>;
   onManageRiders: () => void;
 }) {
+  const [filter, setFilter] = useState<OrderFilter>("active");
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
-  const [assigningOrderId, setAssigningOrderId] = useState<string | null>(null);
-  const [selectedRiderId, setSelectedRiderId] = useState("");
-  const activeRiderControlRef = useRef<HTMLDivElement>(null);
+  const [leavingIds, setLeavingIds] = useState<Set<string>>(new Set());
+  const [cancelTarget, setCancelTarget] = useState<StationOrder | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const selectedOrder = orders.find((order) => order.id === selectedOrderId) ?? null;
+  const cancelOrder = cancelTarget ? orders.find((order) => order.id === cancelTarget.id) ?? null : null;
 
-  useEffect(() => {
-    if (!assigningOrderId) return;
+  const counts = useMemo(() => {
+    const result = { active: 0, completed: 0, cancelled: 0, all: orders.length };
+    for (const order of orders) result[orderBucket(order)] += 1;
+    return result;
+  }, [orders]);
+  const needsYou = useMemo(
+    () => orders.filter((order) => orderBucket(order) === "active" && !getOrderStep(order)?.waiting).length,
+    [orders],
+  );
+  const visibleOrders = filter === "all" ? orders : orders.filter((order) => orderBucket(order) === filter);
 
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      if (event.target instanceof Node && !activeRiderControlRef.current?.contains(event.target)) {
-        setAssigningOrderId(null);
-        setSelectedRiderId("");
-      }
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setAssigningOrderId(null);
-        setSelectedRiderId("");
-      }
-    };
-    document.addEventListener("pointerdown", closeOnOutsideClick);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsideClick);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [assigningOrderId]);
+  const hideOrder = (order: StationOrder) => {
+    setSelectedOrderId(null);
+    const card = listRef.current?.querySelector<HTMLElement>(`[data-order-id="${order.id}"]`);
+    card?.style.setProperty("--so-h", `${card.offsetHeight}px`);
+    setLeavingIds((current) => new Set(current).add(order.id));
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    window.setTimeout(() => {
+      onDismissOrder(order.id);
+      setLeavingIds((current) => {
+        const next = new Set(current);
+        next.delete(order.id);
+        return next;
+      });
+    }, reduceMotion ? 0 : 400);
+  };
+
+  const emptyCopy: Record<OrderFilter, { title: string; description: string }> = {
+    active: counts.all === 0
+      ? { title: "No customer orders yet", description: "New orders show up here the moment a customer places one." }
+      : { title: "You're all caught up", description: "Nothing needs your attention right now. Finished orders are under Completed." },
+    completed: { title: "No completed orders", description: "Delivered orders will be listed here." },
+    cancelled: { title: "No cancelled orders", description: "Cancelled and failed checkouts will be listed here." },
+    all: { title: "No customer orders yet", description: "New orders show up here the moment a customer places one." },
+  };
 
   return (
     <>
       <PageTitle
         title="Station orders"
-        description={`Most recent 100 customer orders placed with ${stationName}.`}
+        description={`Latest 100 orders for ${stationName}.`}
         action={
           <button className="button button-secondary" type="button" onClick={onRefresh} disabled={refreshing}>
-            <RefreshCw size={15} className={refreshing ? "spin" : ""} /> Refresh orders
+            <RefreshCw size={15} className={refreshing ? "spin" : ""} /> Refresh
           </button>
         }
       />
-      {orders.length === 0 ? (
+
+      <div className="so-toolbar">
+        <div className="so-tabs" role="group" aria-label="Filter orders">
+          {orderFilterOptions.map((option) => (
+            <button key={option.value} type="button" aria-pressed={filter === option.value} onClick={() => setFilter(option.value)}>
+              {option.label}<span>{counts[option.value]}</span>
+            </button>
+          ))}
+        </div>
+        <span className={`so-live ${needsYou > 0 ? "has-work" : ""}`}>
+          <i />{needsYou > 0 ? `${needsYou} order${needsYou === 1 ? "" : "s"} need${needsYou === 1 ? "s" : ""} you` : "Live · up to date"}
+        </span>
+      </div>
+
+      {visibleOrders.length === 0 ? (
         <section className="panel">
           <EmptyState
             icon={<ShoppingBag size={21} />}
-            title="No customer orders to display"
-            description="New orders, including cancelled or failed PayMongo checkouts, appear here until you hide them."
+            title={emptyCopy[filter].title}
+            description={emptyCopy[filter].description}
+            action={filter === "active" && counts.completed > 0
+              ? <button className="button button-secondary button-small" type="button" onClick={() => setFilter("completed")}>View completed orders</button>
+              : undefined}
           />
         </section>
       ) : (
-        <div className="station-orders-list station-orders-list-compact">
-          {orders.map((order) => {
+        <div className="so-list" ref={listRef}>
+          {visibleOrders.map((order) => {
             const address = order.address_snapshot ?? {};
             const customerName = typeof address.recipient_name === "string" && address.recipient_name.trim()
               ? address.recipient_name
               : "Customer";
-            const canDismiss = order.status === "delivered" || order.status === "cancelled";
+            const bucket = orderBucket(order);
+            const step = getOrderStep(order);
             const paymentLabel = order.payment_method === "cod"
               ? "Cash on delivery"
               : order.payment_method === "paymongo" ? "PayMongo" : readable(order.payment_method);
-            const canAssignRider = ["ready", "rider_assigned", "out_for_delivery"].includes(order.status);
-            const riderLabel = order.rider_number === null
-              ? null
-              : `Rider ${String(order.rider_number).padStart(2, "0")}`;
+            const leaving = leavingIds.has(order.id);
             return (
-              <article className="panel station-order-card station-order-card-compact" key={order.id}>
-                <button
-                  className="station-order-card-main"
-                  type="button"
-                  onClick={() => setSelectedOrderId(order.id)}
-                  aria-label={`View details for order ${order.order_number}`}
-                >
-                  <div className="station-order-compact-top">
-                    <div className="station-order-identity">
-                      <span className="eyebrow">ORDER NO. #{order.order_number}</span>
+              <article
+                className={`panel so-card ${leaving ? "is-leaving" : ""} ${restoredOrderId === order.id ? "is-restored" : ""}`}
+                data-order-id={order.id}
+                data-bucket={bucket}
+                key={order.id}
+              >
+                <button className="so-card-main" type="button" onClick={() => setSelectedOrderId(order.id)} aria-label={`Open order ${order.order_number} from ${customerName}`}>
+                  <div className="so-card-top">
+                    <div className="so-card-who">
+                      <span className="so-card-num">Order #{order.order_number}</span>
                       <h2>{customerName}</h2>
-                      <span className="station-order-created">
-                        {new Intl.DateTimeFormat("en-PH", { dateStyle: "medium", timeStyle: "short" }).format(new Date(order.created_at))}
-                      </span>
+                      <span className="so-card-time">{timeAgo(order.created_at)}</span>
                     </div>
-                    <div className="station-order-compact-total">
-                      <span className={`pill pill-${statusTone(order.status)}`}>{readable(order.status)}</span>
+                    <div className="so-card-money">
                       <strong>{money(order.total)}</strong>
+                      <span className={`pill pill-${statusTone(order.status)}`}>{readable(order.status)}</span>
                     </div>
                   </div>
-                  <div className="station-order-compact-meta">
-                    <span><small>Payment</small><strong>{paymentLabel}</strong></span>
-                    <span><small>Delivery fee</small><strong>{order.delivery_fee === 0 ? "Free" : money(order.delivery_fee)}</strong></span>
-                    {riderLabel && <span><small>Assigned rider</small><strong>{riderLabel}{order.rider_name ? ` · ${order.rider_name}` : ""}</strong></span>}
-                  </div>
-                  <span className="station-order-card-hint"><Eye size={14} /> Tap to view customer details and update it's status<ArrowRight size={14} /></span>
-                </button>
-                {canAssignRider && (
-                  <div
-                    className="station-order-rider"
-                    ref={assigningOrderId === order.id ? activeRiderControlRef : null}
-                  >
-                    <button
-                      className="button button-secondary button-small"
-                      type="button"
-                      aria-expanded={assigningOrderId === order.id}
-                      onClick={() => {
-                        const opening = assigningOrderId !== order.id;
-                        setAssigningOrderId(opening ? order.id : null);
-                        const assigned = order.rider_number === null
-                          ? null
-                          : riders.find((rider) => rider.rider_number === order.rider_number);
-                        setSelectedRiderId(opening ? assigned?.id ?? "" : "");
-                      }}
-                    >
-                      <Truck size={14} /> {order.rider_number === null ? "Assign rider" : "Change rider"}
-                    </button>
-                    {assigningOrderId === order.id && (
-                      <div className="station-order-rider-picker">
-                        {riders.length === 0 ? (
-                          <p>No riders added yet. <button type="button" onClick={onManageRiders}>Manage riders</button></p>
-                        ) : (
-                          <>
-                            <label>
-                              <span className="sr-only">Choose a delivery rider for order {order.order_number}</span>
-                              <select value={selectedRiderId} onChange={(event) => setSelectedRiderId(event.target.value)}>
-                                <option value="">Select a rider</option>
-                                {riders.map((rider) => (
-                                  <option key={rider.id} value={rider.id}>
-                                    Rider {String(rider.rider_number).padStart(2, "0")} · {rider.name} · {rider.phone}
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                            <button
-                              className="button button-primary button-small"
-                              type="button"
-                              disabled={!selectedRiderId || updatingOrderId === order.id}
-                              onClick={() => {
-                                void onAssignRider(order, selectedRiderId).then((assigned) => {
-                                  if (assigned) setAssigningOrderId(null);
-                                });
-                              }}
-                            >
-                              {updatingOrderId === order.id ? <span className="spinner spinner-light" /> : <Check size={14} />}
-                              Assign
-                            </button>
-                            <button
-                              className="button button-secondary button-small"
-                              type="button"
-                              onClick={() => {
-                                setAssigningOrderId(null);
-                                setSelectedRiderId("");
-                              }}
-                            >
-                              Cancel
-                            </button>
-                          </>
-                        )}
-                        {riders.length === 0 && (
-                          <button
-                            className="button button-secondary button-small"
-                            type="button"
-                            onClick={() => {
-                              setAssigningOrderId(null);
-                              setSelectedRiderId("");
-                            }}
-                          >
-                            Cancel
-                          </button>
-                        )}
-                      </div>
+                  <p className="so-card-items"><Droplets size={14} /> {orderItemsSummary(order)}</p>
+                  <div className="so-card-foot">
+                    <span className="so-card-meta">
+                      {paymentLabel}
+                      <i />{order.delivery_fee === 0 ? "Free delivery" : `${money(order.delivery_fee)} delivery`}
+                      {orderHasRider(order) && <><i /><Truck size={12} /> {riderLabelFor(order)}</>}
+                    </span>
+                    {step ? (
+                      <span className={`so-card-next ${step.waiting ? "is-waiting" : step.needsRider ? "is-urgent" : ""}`}>
+                        {step.waiting ? "Waiting for payment" : step.needsRider ? "Assign rider" : step.label}
+                        <ArrowRight size={14} />
+                      </span>
+                    ) : (
+                      <span className="so-card-next is-done"><Eye size={14} /> View details</span>
                     )}
                   </div>
-                )}
-                {canDismiss && (
+                </button>
+                {bucket !== "active" && (
                   <button
-                    className="icon-button station-order-dismiss station-order-compact-trash"
+                    className="icon-button so-card-trash"
                     type="button"
-                    aria-label={`Hide order ${order.order_number}`}
+                    aria-label={`Hide order ${order.order_number} from your list`}
                     title="Hide from my list"
-                    disabled={dismissingOrderId === order.id}
-                    onClick={() => onDismissOrder(order.id)}
+                    disabled={leaving}
+                    onClick={() => hideOrder(order)}
                   >
-                    {dismissingOrderId === order.id ? <span className="spinner" /> : <Trash2 size={16} />}
+                    <Trash2 size={16} />
                   </button>
                 )}
               </article>
@@ -3610,57 +3805,78 @@ function StationOrdersSection({
 
       {selectedOrder && (
         <StationOrderDetailDrawer
+          key={selectedOrder.id}
           order={selectedOrder}
-          dismissing={dismissingOrderId === selectedOrder.id}
           updating={updatingOrderId === selectedOrder.id}
           onClose={() => setSelectedOrderId(null)}
-          onDismiss={() => onDismissOrder(selectedOrder.id)}
+          onHide={() => hideOrder(selectedOrder)}
           onUpdateStatus={(status) => onUpdateOrderStatus(selectedOrder, status)}
-          onCancel={() => onCancelOrder(selectedOrder)}
+          onRequestCancel={() => setCancelTarget(selectedOrder)}
           riders={riders}
           onAssignRider={(riderId) => onAssignRider(selectedOrder, riderId)}
           onManageRiders={onManageRiders}
+        />
+      )}
+      {cancelOrder && (
+        <CancelOrderDialog
+          order={cancelOrder}
+          busy={updatingOrderId === cancelOrder.id}
+          onClose={() => setCancelTarget(null)}
+          onConfirm={(reason) => {
+            void onCancelOrder(cancelOrder, reason).then((cancelled) => {
+              if (cancelled) setCancelTarget(null);
+            });
+          }}
         />
       )}
     </>
   );
 }
 
+const orderTrackerSteps = [
+  { key: "pending", label: "Placed" },
+  { key: "confirmed", label: "Confirmed" },
+  { key: "preparing", label: "Preparing" },
+  { key: "ready", label: "Ready" },
+  { key: "out_for_delivery", label: "On the way" },
+  { key: "delivered", label: "Delivered" },
+] as const;
+
 function StationOrderDetailDrawer({
   order,
-  dismissing,
   updating,
   onClose,
-  onDismiss,
+  onHide,
   onUpdateStatus,
-  onCancel,
+  onRequestCancel,
   riders,
   onAssignRider,
   onManageRiders,
 }: {
   order: StationOrder;
-  dismissing: boolean;
   updating: boolean;
   onClose: () => void;
-  onDismiss: () => void;
+  onHide: () => void;
   onUpdateStatus: (status: string) => void;
-  onCancel: () => void;
+  onRequestCancel: () => void;
   riders: StationRider[];
   onAssignRider: (riderId: string) => Promise<boolean>;
   onManageRiders: () => void;
 }) {
-  const [showRiderPicker, setShowRiderPicker] = useState(false);
+  const [changingRider, setChangingRider] = useState(false);
   const [selectedRiderId, setSelectedRiderId] = useState("");
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") onCloseRef.current();
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, []);
 
   const address = order.address_snapshot ?? {};
-  const customerName = typeof address.recipient_name === "string" ? address.recipient_name : "Customer";
+  const customerName = typeof address.recipient_name === "string" && address.recipient_name.trim() ? address.recipient_name : "Customer";
   const customerPhone = typeof address.phone === "string"
     ? address.phone
     : typeof address.recipient_phone === "string" ? address.recipient_phone : "";
@@ -3676,16 +3892,27 @@ function StationOrderDetailDrawer({
   const mapUrl = latitude !== null && longitude !== null
     ? `https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}` : null;
   const customerNotes = order.customer_notes?.trim() ?? "";
-  const next = nextOrderStatus[order.status];
+
+  const step = getOrderStep(order);
+  const bucket = orderBucket(order);
+  const hasRider = orderHasRider(order);
   const canCancel = ["pending", "confirmed", "preparing", "ready", "rider_assigned"].includes(order.status);
-  const canDismiss = order.status === "delivered" || order.status === "cancelled";
-  const waitingForPayment = order.payment_method === "paymongo" && order.payment_status !== "paid";
-  const progressSteps = ["pending", "confirmed", "preparing", "ready", "out_for_delivery", "delivered"] as const;
-  const progressLabels = ["Pending", "Confirmed", "Preparing", "Ready", "Out for delivery", "Delivered"];
+  const canChangeRider = hasRider && ["ready", "rider_assigned"].includes(order.status);
+  const showPicker = Boolean(step?.needsRider) || changingRider;
   const progressStatus = order.status === "rider_assigned" ? "ready" : order.status;
-  const currentIndex = progressSteps.indexOf(progressStatus as typeof progressSteps[number]);
-  const requiresRider = next?.status === "out_for_delivery";
-  const riderNotAssigned = requiresRider && (!order.rider_name || !order.rider_phone);
+  const currentIndex = orderTrackerSteps.findIndex((item) => item.key === progressStatus);
+  const paymentText = order.payment_method === "cod"
+    ? "Cash on delivery"
+    : `${readable(order.payment_method)} · ${paymentStatusLabel(order.payment_status)}`;
+
+  const assignSelected = () => {
+    void onAssignRider(selectedRiderId).then((assigned) => {
+      if (assigned) {
+        setChangingRider(false);
+        setSelectedRiderId("");
+      }
+    });
+  };
 
   return (
     <div
@@ -3696,37 +3923,119 @@ function StationOrderDetailDrawer({
       <section className="station-order-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="station-order-detail-title">
         <header className="station-order-detail-header">
           <div>
-            <span className="eyebrow">CUSTOMER ORDER</span>
-            <h2 id="station-order-detail-title">Order #{order.order_number}</h2>
-            <p>{customerName} · {new Intl.DateTimeFormat("en-PH", { dateStyle: "medium", timeStyle: "short" }).format(new Date(order.created_at))}</p>
+            <span className="eyebrow">ORDER #{order.order_number}</span>
+            <h2 id="station-order-detail-title">{customerName}</h2>
+            <p>
+              {new Intl.DateTimeFormat("en-PH", { dateStyle: "medium", timeStyle: "short" }).format(new Date(order.created_at))}
+              <span className={`pill pill-${statusTone(order.status)}`}>{readable(order.status)}</span>
+            </p>
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close order details"><X size={18} /></button>
         </header>
 
         <div className="station-order-detail-body">
-          <section className="station-order-summary-grid" aria-label="Order summary">
-            <div><span>Order status</span><strong><span className={`pill pill-${statusTone(order.status)}`}>{readable(order.status)}</span></strong></div>
-            <div><span>Payment method</span><strong>{order.payment_method === "cod" ? "Cash on delivery" : readable(order.payment_method)}</strong></div>
-            <div><span>Payment status</span><strong>{order.payment_method === "cod" ? "Pay on delivery" : paymentStatusLabel(order.payment_status)}</strong></div>
-            <div><span>Order total</span><strong className="station-order-detail-price">{money(order.total)}</strong></div>
+          {bucket === "active" && step && (
+            <section className={`so-next ${step.waiting ? "is-waiting" : ""}`} key={`${order.status}-${hasRider}-${showPicker}`} aria-live="polite">
+              <div className="so-next-head">
+                <span className="so-next-eyebrow">{step.waiting ? "On hold" : `Step ${Math.max(currentIndex, 0) + 1} of ${orderTrackerSteps.length}`}</span>
+                <h3>{showPicker && hasRider ? "Change the rider" : step.title}</h3>
+                <p>{showPicker && hasRider ? "Pick a different rider for this order." : step.description}</p>
+              </div>
+
+              {hasRider && !showPicker && (
+                <div className="so-assigned">
+                  <span className="so-rider-avatar">{initialsOf(order.rider_name ?? "R")}</span>
+                  <div>
+                    <strong>{order.rider_name}</strong>
+                    <a href={`tel:${order.rider_phone}`}><Phone size={12} /> {order.rider_phone}</a>
+                  </div>
+                  {canChangeRider && (
+                    <button className="text-link" type="button" onClick={() => setChangingRider(true)}>Change rider</button>
+                  )}
+                </div>
+              )}
+
+              {showPicker && (
+                <RiderPicker riders={riders} selectedId={selectedRiderId} onSelect={setSelectedRiderId} onManageRiders={onManageRiders} />
+              )}
+
+              <div className="so-next-actions">
+                {showPicker ? (
+                  <>
+                    <button className="button button-primary so-primary" type="button" disabled={!selectedRiderId || updating || riders.length === 0} onClick={assignSelected}>
+                      {updating ? <span className="spinner spinner-light" /> : <Truck size={16} />} {hasRider ? "Switch rider" : "Assign rider"}
+                    </button>
+                    {changingRider && (
+                      <button className="button button-secondary" type="button" onClick={() => { setChangingRider(false); setSelectedRiderId(""); }}>Keep current rider</button>
+                    )}
+                  </>
+                ) : step.status && (
+                  <button className="button button-primary so-primary" type="button" disabled={updating || step.waiting} onClick={() => onUpdateStatus(step.status!)}>
+                    {updating ? <span className="spinner spinner-light" /> : <Check size={16} />} {step.label}
+                  </button>
+                )}
+                {step.waiting && <span className="so-next-hint">Unlocks after payment is confirmed.</span>}
+              </div>
+            </section>
+          )}
+
+          {bucket === "completed" && (
+            <section className="so-next so-next-done">
+              <span className="so-done-icon"><Check size={20} strokeWidth={3} /></span>
+              <div>
+                <h3>Order completed</h3>
+                <p>{order.delivered_at ? `Delivered ${formatDate(order.delivered_at)}.` : "This order was delivered."}</p>
+              </div>
+            </section>
+          )}
+          {bucket === "cancelled" && (
+            <section className="so-next so-next-cancelled">
+              <span className="so-done-icon"><X size={20} strokeWidth={3} /></span>
+              <div>
+                <h3>Order cancelled</h3>
+                <p>This order was cancelled and will not be delivered.</p>
+              </div>
+            </section>
+          )}
+
+          {bucket !== "cancelled" && (
+            <div className="order-stepper so-tracker" aria-label="Order progress">
+              {orderTrackerSteps.map((item, index) => {
+                const complete = currentIndex >= index;
+                const active = currentIndex === index;
+                return (
+                  <div className={`order-step ${complete ? "is-complete" : ""} ${active ? "is-current" : ""}`} key={item.key}>
+                    <div className="order-step-track">
+                      <span className="order-step-dot">{complete && !active ? <Check size={13} strokeWidth={3} /> : index + 1}</span>
+                      {index < orderTrackerSteps.length - 1 && <span className={`order-step-line ${currentIndex > index ? "is-complete" : ""}`} />}
+                    </div>
+                    <span className="order-step-label">{item.label}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <section className="so-facts" aria-label="Payment and total">
+            <div><span>Payment</span><strong>{paymentText}</strong></div>
             <div><span>Delivery fee</span><strong>{order.delivery_fee === 0 ? "Free" : money(order.delivery_fee)}</strong></div>
-            <div><span>Order number</span><strong>#{order.order_number}</strong></div>
+            <div><span>Total</span><strong className="so-facts-total">{money(order.total)}</strong></div>
           </section>
 
           <section className="station-order-detail-section">
-            <div className="station-order-detail-section-title"><MapPin size={16} /><h3>Customer & delivery details</h3></div>
+            <div className="station-order-detail-section-title"><MapPin size={16} /><h3>Deliver to</h3></div>
             <dl className="station-order-detail-list">
-              <div><dt>Customer name</dt><dd>{customerName}</dd></div>
-              <div><dt>Phone number</dt><dd>{customerPhone ? <a href={`tel:${customerPhone}`}>{customerPhone}</a> : "Not provided"}</dd></div>
-              <div className="is-wide"><dt>Delivery address{addressLabel ? ` · ${addressLabel}` : ""}</dt><dd>{addressText || "Address not available"}</dd></div>
+              <div><dt>Customer</dt><dd>{customerName}</dd></div>
+              <div><dt>Phone</dt><dd>{customerPhone ? <a href={`tel:${customerPhone}`}>{customerPhone}</a> : "Not provided"}</dd></div>
+              <div className="is-wide"><dt>Address{addressLabel ? ` · ${addressLabel}` : ""}</dt><dd>{addressText || "Address not available"}</dd></div>
               {landmark && <div className="is-wide"><dt>Landmark</dt><dd>{landmark}</dd></div>}
-              {customerNotes && <div className="is-wide"><dt>Customer instructions</dt><dd>{customerNotes}</dd></div>}
-              {mapUrl && <div className="is-wide"><dt>Map location</dt><dd><a href={mapUrl} target="_blank" rel="noreferrer">Open delivery pin in Google Maps <ExternalLink size={13} /></a></dd></div>}
+              {customerNotes && <div className="is-wide"><dt>Customer notes</dt><dd>{customerNotes}</dd></div>}
+              {mapUrl && <div className="is-wide"><dt>Map</dt><dd><a href={mapUrl} target="_blank" rel="noreferrer">Open pin in Google Maps <ExternalLink size={13} /></a></dd></div>}
             </dl>
           </section>
 
           <section className="station-order-detail-section">
-            <div className="station-order-detail-section-title"><ShoppingBag size={16} /><h3>Order items</h3><span className="station-order-item-count">{order.items.length} {order.items.length === 1 ? "item" : "items"}</span></div>
+            <div className="station-order-detail-section-title"><ShoppingBag size={16} /><h3>Items</h3><span className="station-order-item-count">{order.items.length} {order.items.length === 1 ? "item" : "items"}</span></div>
             <div className="station-order-detail-items">
               {order.items.map((item, index) => (
                 <div className="station-order-detail-item" key={`${order.id}-${index}`}>
@@ -3737,130 +4046,47 @@ function StationOrderDetailDrawer({
               ))}
               {order.items.length === 0 && <p className="muted">Order items are not available.</p>}
             </div>
-            <div className="station-order-totals">
-              <div><span>Delivery fee</span><strong>{order.delivery_fee === 0 ? "Free" : money(order.delivery_fee)}</strong></div>
-              <div className="station-order-grand-total"><span>Total</span><strong>{money(order.total)}</strong></div>
-            </div>
           </section>
 
-          <section className="station-order-detail-section station-order-progress-detail">
-            <div className="station-order-detail-section-title"><ClipboardList size={16} /><h3>Order progress</h3></div>
-            <p className="station-order-progress-copy">
-              {waitingForPayment ? "Waiting for payment confirmation before processing."
-                : order.status === "delivered" ? "Order completed successfully."
-                : order.status === "cancelled" ? "This order has been cancelled."
-                : order.status === "rider_assigned" ? "A rider is assigned. Mark the order out for delivery when they begin the trip."
-                : order.status === "out_for_delivery" ? "The rider is on the way to the customer."
-                : `Next step: ${next?.label ?? "No further steps"}.`}
-            </p>
-            {order.status === "cancelled" ? (
-              <div className="station-order-terminal-state"><CircleAlert size={16} /> Cancelled order</div>
-            ) : (
-              <div className="order-stepper">
-                {progressSteps.map((step, index) => {
-                  const complete = currentIndex >= index;
-                  const active = currentIndex === index;
-                  return (
-                    <div className={`order-step ${complete ? "is-complete" : ""} ${active ? "is-current" : ""}`} key={step}>
-                      <div className="order-step-track">
-                        <span className="order-step-dot">{complete && !active ? <Check size={13} strokeWidth={3} /> : index + 1}</span>
-                        {index < progressSteps.length - 1 && <span className={`order-step-line ${currentIndex > index ? "is-complete" : ""}`} />}
-                      </div>
-                      <span className="order-step-label">{progressLabels[index]}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        </div>
-
-        {(next || canCancel || canDismiss) && (
-          <footer className="station-order-detail-footer">
-            <div className="station-order-detail-footer-copy">
-              <strong>{canDismiss ? "Order history" : waitingForPayment && order.status === "pending" ? "Payment required" : "Order actions"}</strong>
-              <span>{canDismiss ? "You can hide this completed order from your list." : waitingForPayment ? "Order processing unlocks after PayMongo confirms payment." : "Update the order as it moves through your station."}</span>
-            </div>
-            <div className="station-order-detail-actions">
-              {canDismiss && <button className="button button-secondary button-small" type="button" disabled={dismissing} onClick={onDismiss}>{dismissing ? <span className="spinner" /> : <Trash2 size={14} />} Hide order</button>}
-              {canCancel && <button className="button button-secondary button-small station-order-cancel" type="button" disabled={updating} onClick={onCancel}>{updating ? <span className="spinner" /> : <X size={14} />} Cancel order</button>}
-              {next && (
-                riderNotAssigned ? (
-                  <button
-                    className="button button-primary button-small"
-                    type="button"
-                    onClick={() => setShowRiderPicker((visible) => !visible)}
-                    aria-expanded={showRiderPicker}
-                    aria-controls="station-order-rider-picker"
-                  >
-                    <Truck size={14} /> Assign rider
-                  </button>
-                ) : (
-                  <button
-                    className="button button-primary button-small"
-                    type="button"
-                    disabled={updating || waitingForPayment}
-                    title={waitingForPayment ? "Wait until PayMongo payment is received before confirming." : undefined}
-                    onClick={() => onUpdateStatus(next.status)}
-                  >
-                    {updating ? <span className="spinner spinner-light" /> : <Check size={14} />}
-                    {waitingForPayment && order.status === "pending" ? "Waiting for payment" : next.label}
-                  </button>
-                )
+          {(canCancel || bucket !== "active") && (
+            <section className="so-quiet">
+              {canCancel ? (
+                <>
+                  <div><strong>Can't fulfil this order?</strong><span>Cancel it and tell the customer why.</span></div>
+                  <button className="button button-secondary button-small so-cancel-link" type="button" disabled={updating} onClick={onRequestCancel}><X size={14} /> Cancel order</button>
+                </>
+              ) : (
+                <>
+                  <div><strong>Done with this order?</strong><span>Hide it from your list. Order and payment records are kept.</span></div>
+                  <button className="button button-secondary button-small" type="button" onClick={onHide}><Trash2 size={14} /> Hide from list</button>
+                </>
               )}
-            </div>
-            {showRiderPicker && (
-              <div className="station-order-rider-picker station-order-detail-rider-picker" id="station-order-rider-picker">
-                {riders.length === 0 ? (
-                  <p>No riders added yet. <button type="button" onClick={onManageRiders}>Manage riders</button></p>
-                ) : (
-                  <>
-                    <label>
-                      <span className="sr-only">Choose a delivery rider for order {order.order_number}</span>
-                      <select value={selectedRiderId} onChange={(event) => setSelectedRiderId(event.target.value)}>
-                        <option value="">Select a rider</option>
-                        {riders.map((rider) => (
-                          <option key={rider.id} value={rider.id}>
-                            Rider {String(rider.rider_number).padStart(2, "0")} · {rider.name} · {rider.phone}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <button
-                      className="button button-primary button-small"
-                      type="button"
-                      disabled={!selectedRiderId || updating}
-                      onClick={() => {
-                        void onAssignRider(selectedRiderId).then((assigned) => {
-                          if (assigned) {
-                            setShowRiderPicker(false);
-                            setSelectedRiderId("");
-                          }
-                        });
-                      }}
-                    >
-                      {updating ? <span className="spinner spinner-light" /> : <Check size={14} />} Assign
-                    </button>
-                    <button
-                      className="button button-secondary button-small"
-                      type="button"
-                      onClick={() => {
-                        setShowRiderPicker(false);
-                        setSelectedRiderId("");
-                      }}
-                    >
-                      Cancel
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
-          </footer>
-        )}
+            </section>
+          )}
+        </div>
       </section>
     </div>
   );
 }
+
+interface SetupStep {
+  id: string;
+  group: "Profile" | "Delivery" | "Products" | "Documents";
+  title: string;
+  detail: string;
+  section: PortalSection;
+  done: boolean;
+  documentType?: string;
+}
+
+const setupSectionLabel: Record<PortalSection, string> = {
+  overview: "Overview",
+  orders: "Orders",
+  products: "Products",
+  delivery: "Delivery setup",
+  riders: "Riders",
+  application: "Station details",
+};
 
 function ApplicationSection({
   application,
@@ -3886,18 +4112,20 @@ function ApplicationSection({
   onNotice: (notice: Notice | null) => void;
 }) {
   const [uploadingType, setUploadingType] = useState<string | null>(null);
+  const [dragType, setDragType] = useState<string | null>(null);
   const permitDocument = documents.find((document) => document.document_type === "business_permit");
   const [permitExpiry, setPermitExpiry] = useState(
     permitDocument?.expires_at ?? "",
   );
   const [submitting, setSubmitting] = useState(false);
-  const [showSubmissionReadiness, setShowSubmissionReadiness] = useState(false);
   useEffect(() => {
     setPermitExpiry(permitDocument?.expires_at ?? "");
   }, [permitDocument?.id, permitDocument?.expires_at]);
   const requiredTypes = requirements.filter((requirement) => requirement.required);
   const today = new Date();
   const localToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  const tomorrowDate = new Date(today.getTime() + 86400000);
+  const localTomorrow = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth() + 1).padStart(2, "0")}-${String(tomorrowDate.getDate()).padStart(2, "0")}`;
   const activeProducts = products.filter((product) => product.status === "active");
   const activePolicyTypes = new Set(
     containerPolicies.filter((policy) => policy.is_active).map((policy) => policy.container_type_id),
@@ -3905,71 +4133,55 @@ function ApplicationSection({
   const openDays = operatingHours.filter((hour) =>
     !hour.is_closed && hour.opens_at && hour.closes_at && hour.opens_at.slice(0, 5) !== hour.closes_at.slice(0, 5),
   );
-  const submissionBlockers: Array<{ label: string; section: PortalSection; detail: string }> = [];
 
-  if (!application.legal_business_name.trim()
-    || !application.display_name.trim()
-    || !application.phone.trim()
-    || !application.address_line.trim()
-    || !application.city.trim()
-    || !application.province.trim()
-    || application.latitude === null
-    || application.longitude === null) {
-    submissionBlockers.push({
-      label: "Complete the station profile",
-      section: "application",
-      detail: "Business name, station name, phone, address, and map coordinates are required.",
-    });
-  }
+  // ---- every setup requirement as a step, done or not ----
+  const steps: SetupStep[] = [];
+  const profileComplete = Boolean(application.legal_business_name.trim()
+    && application.display_name.trim()
+    && application.phone.trim()
+    && application.address_line.trim()
+    && application.city.trim()
+    && application.province.trim()
+    && application.latitude !== null
+    && application.longitude !== null);
+  steps.push({
+    id: "profile", group: "Profile", title: "Business and location details", section: "application", done: profileComplete,
+    detail: "Business name, station name, phone, address and map pin are required.",
+  });
   if (!station) {
-    submissionBlockers.push({
-      label: "Set up your station",
-      section: "application",
+    steps.push({
+      id: "station", group: "Profile", title: "Station record", section: "application", done: false,
       detail: "The station record is missing. Refresh the page or contact support.",
     });
-  } else {
-    const radius = Number(station.service_radius_km);
-    const fee = Number(station.default_delivery_fee);
-    const minimum = Number(station.minimum_order_amount);
-    if (!Number.isFinite(radius) || radius <= 0) {
-      submissionBlockers.push({
-        label: "Set your delivery radius",
-        section: "delivery",
-        detail: "Enter a delivery radius greater than zero in Delivery setup.",
-      });
-    }
-    if (!Number.isFinite(fee) || fee < 0 || !Number.isFinite(minimum) || minimum < 0) {
-      submissionBlockers.push({
-        label: "Set valid delivery fees",
-        section: "delivery",
-        detail: "Delivery fee and minimum order must be valid amounts of zero or more.",
-      });
-    }
   }
-  if (activeProducts.length === 0) {
-    submissionBlockers.push({
-      label: "Add an active water product",
-      section: "products",
-      detail: "At least one active product with a price and starting stock is required.",
-    });
-  } else if (activeProducts.some((product) => !activePolicyTypes.has(product.container_type_id))) {
-    submissionBlockers.push({
-      label: "Finish product container policies",
-      section: "products",
-      detail: "Edit and save each active product so its container return policy is saved.",
-    });
-  }
-  if (openDays.length === 0) {
-    submissionBlockers.push({
-      label: "Set operating hours",
-      section: "delivery",
-      detail: "Add at least one open day with different opening and closing times.",
-    });
-  }
+  const radius = Number(station?.service_radius_km);
+  const fee = Number(station?.default_delivery_fee);
+  const minimum = Number(station?.minimum_order_amount);
+  steps.push({
+    id: "radius", group: "Delivery", title: "Delivery radius", section: "delivery",
+    done: Boolean(station) && Number.isFinite(radius) && radius > 0,
+    detail: "Enter a delivery radius greater than zero in Delivery setup.",
+  });
+  steps.push({
+    id: "fees", group: "Delivery", title: "Delivery fee and minimum order", section: "delivery",
+    done: Boolean(station) && Number.isFinite(fee) && fee >= 0 && Number.isFinite(minimum) && minimum >= 0,
+    detail: "Delivery fee and minimum order must be amounts of zero or more.",
+  });
+  steps.push({
+    id: "hours", group: "Delivery", title: "Operating hours", section: "delivery", done: openDays.length > 0,
+    detail: "Add at least one open day with different opening and closing times.",
+  });
+  const missingPolicy = activeProducts.some((product) => !activePolicyTypes.has(product.container_type_id));
+  steps.push({
+    id: "products", group: "Products", title: "An active water product", section: "products",
+    done: activeProducts.length > 0 && !missingPolicy,
+    detail: activeProducts.length === 0
+      ? "Add at least one active product with a price and starting stock."
+      : "Edit and save each active product so its container return policy is saved.",
+  });
   if (requiredTypes.length === 0) {
-    submissionBlockers.push({
-      label: "Check required documents",
-      section: "application",
+    steps.push({
+      id: "no-requirements", group: "Documents", title: "Document requirements", section: "application", done: false,
       detail: "No document requirements were returned. Refresh or contact support before submitting.",
     });
   }
@@ -3977,61 +4189,88 @@ function ApplicationSection({
     const document = documents.find((item) =>
       item.document_type === requirement.document_type && item.required_for_verification,
     );
-    const documentName = readable(requirement.document_type);
-    if (!document) {
-      submissionBlockers.push({
-        label: `Upload ${documentName}`,
-        section: "application",
-        detail: `${documentName} is required and has not been uploaded.`,
-      });
-    } else if (document.review_status === "rejected") {
-      submissionBlockers.push({
-        label: `Replace ${documentName}`,
-        section: "application",
-        detail: document.review_notes || `${documentName} was rejected. Upload a replacement before resubmitting.`,
-      });
-    } else if (requirement.document_type === "business_permit") {
-      if (!permitExpiry || permitExpiry <= localToday) {
-        submissionBlockers.push({
-          label: `Update ${documentName}`,
-          section: "application",
-          detail: "Choose a future expiry date, then upload the updated permit to save it.",
-        });
-      } else if (permitExpiry !== document.expires_at) {
-        submissionBlockers.push({
-          label: `Replace ${documentName}`,
-          section: "application",
-          detail: "The new expiry date is not saved yet. Upload the permit again to save the date with the file.",
-        });
-      } else if (!document.expires_at || document.expires_at <= localToday) {
-        submissionBlockers.push({
-          label: `Replace ${documentName}`,
-          section: "application",
-          detail: "The saved permit expiry date has passed. Upload a current permit with a future expiry date.",
-        });
+    const name = readable(requirement.document_type);
+    let done = false;
+    let detail = `${name} is required and has not been uploaded.`;
+    if (document) {
+      if (document.review_status === "rejected") {
+        detail = document.review_notes || `${name} was rejected. Upload a replacement before resubmitting.`;
+      } else if (requirement.document_type === "business_permit") {
+        if (!permitExpiry || permitExpiry <= localToday) {
+          detail = "Choose a future expiry date, then upload the updated permit to save it.";
+        } else if (permitExpiry !== document.expires_at) {
+          detail = "The new expiry date isn't saved yet. Upload the permit again to save it with the file.";
+        } else if (!document.expires_at || document.expires_at <= localToday) {
+          detail = "The saved permit has expired. Upload a current permit with a future expiry date.";
+        } else {
+          done = true;
+        }
+      } else if (document.expires_at !== null && document.expires_at <= localToday) {
+        detail = `${name} must have a future expiry date.`;
+      } else {
+        done = true;
       }
-    } else if (document.expires_at !== null && document.expires_at <= localToday) {
-      submissionBlockers.push({
-        label: `Update ${documentName}`,
-        section: "application",
-        detail: `${documentName} must have a future expiry date.`,
-      });
     }
+    steps.push({
+      id: `doc:${requirement.document_type}`, group: "Documents", title: name, section: "application", done, detail,
+      documentType: requirement.document_type,
+    });
   }
-  const nonRequiredExpiredDocument = documents.find((document) =>
+  const staleDocument = documents.find((document) =>
     !requiredTypes.some((requirement) => requirement.document_type === document.document_type)
     && document.expires_at !== null
     && document.expires_at <= localToday,
   );
-  if (nonRequiredExpiredDocument) {
-    submissionBlockers.push({
-      label: `Replace ${readable(nonRequiredExpiredDocument.document_type)}`,
-      section: "application",
+  if (staleDocument) {
+    steps.push({
+      id: `doc-stale:${staleDocument.id}`, group: "Documents", title: `Replace ${readable(staleDocument.document_type)}`, section: "application", done: false,
       detail: "Every current verification document must be unexpired.",
     });
   }
+
+  const pending = steps.filter((item) => !item.done);
+  const doneCount = steps.length - pending.length;
+  const percent = steps.length === 0 ? 0 : Math.round((doneCount / steps.length) * 100);
+  const nextStep = pending[0] ?? null;
   const canSubmit = application.application_status === "draft"
     || application.application_status === "changes_requested";
+  const published = station?.publication_status === "published";
+  const groups = (["Profile", "Delivery", "Products", "Documents"] as const)
+    .map((name) => {
+      const items = steps.filter((item) => item.group === name);
+      return { name, items, done: items.filter((item) => item.done).length };
+    })
+    .filter((group) => group.items.length > 0);
+
+  const headline = published ? "Your station is live"
+    : application.application_status === "approved" ? "Application approved"
+      : application.application_status === "rejected" ? "Application not approved"
+        : !canSubmit ? "Under review"
+          : application.application_status === "changes_requested" ? "Changes requested"
+            : pending.length > 0 ? `${pending.length} step${pending.length === 1 ? "" : "s"} left before you can submit`
+              : "Ready to submit";
+  const subline = published ? "Customers can find your station and order from you."
+    : application.application_status === "approved" ? "Your documents were verified. Customers see your active products once the station is verified and published."
+      : application.application_status === "rejected" ? "Contact AquaDirect support if you think this was a mistake."
+        : !canSubmit ? "The AquaDirect team is reviewing your documents. Uploads are locked until they respond."
+          : application.application_status === "changes_requested" ? "Check the notes on each document, fix what's flagged, then submit again."
+            : pending.length > 0 ? "Finish each step below. We save your progress as you go."
+              : "Everything checks out. Submit your station so the team can verify it.";
+
+  function goTo(item: SetupStep) {
+    if (item.documentType) {
+      const card = window.document.getElementById(`doc-${item.documentType}`);
+      card?.scrollIntoView({ behavior: "smooth", block: "center" });
+      card?.classList.add("is-flash");
+      window.setTimeout(() => card?.classList.remove("is-flash"), 1400);
+      return;
+    }
+    if (item.section === "application") {
+      window.document.getElementById("station-details")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    onNavigate(item.section);
+  }
 
   async function uploadDocument(documentType: string, file: File | undefined) {
     if (!supabase || !file) return;
@@ -4044,7 +4283,7 @@ function ApplicationSection({
       return;
     }
     if (documentType === "business_permit" && (!permitExpiry || permitExpiry <= localToday)) {
-      onNotice({ kind: "error", text: "Choose a future business permit expiry date before uploading." });
+      onNotice({ kind: "error", text: "Choose a future permit expiry date first." });
       return;
     }
     setUploadingType(documentType);
@@ -4071,7 +4310,7 @@ function ApplicationSection({
       if (storageError) {
         throw new Error(`Document details were saved, but the file upload failed: ${storageError.message}. Try uploading again.`);
       }
-      onNotice({ kind: "success", text: `${readable(documentType)} uploaded successfully.` });
+      onNotice({ kind: "success", text: `${readable(documentType)} uploaded` });
       onRefresh();
     } catch (error) {
       onNotice({ kind: "error", text: error instanceof Error ? error.message : "Document could not be uploaded." });
@@ -4082,12 +4321,9 @@ function ApplicationSection({
 
   async function submitApplication() {
     if (!supabase) return;
-    setShowSubmissionReadiness(true);
-    if (submissionBlockers.length > 0) {
-      onNotice({
-        kind: "error",
-        text: `Complete ${submissionBlockers.length} required setup item${submissionBlockers.length === 1 ? "" : "s"} before submitting for review.`,
-      });
+    if (pending.length > 0) {
+      onNotice({ kind: "error", text: `Finish ${pending.length} more step${pending.length === 1 ? "" : "s"} before submitting.` });
+      if (nextStep) goTo(nextStep);
       return;
     }
     setSubmitting(true);
@@ -4096,7 +4332,7 @@ function ApplicationSection({
     setSubmitting(false);
     if (error) onNotice({ kind: "error", text: error.message });
     else {
-      onNotice({ kind: "success", text: "Application submitted. The AquaDirect team will review your station documents." });
+      onNotice({ kind: "success", text: "Submitted for review" });
       onRefresh();
     }
   }
@@ -4105,102 +4341,165 @@ function ApplicationSection({
     <>
       <PageTitle
         title="Application & verification"
-        description="Track your station review and keep the location details accurate."
-        action={<span className={`pill pill-${station?.publication_status === "published" ? "green" : statusTone(application.application_status)}`}>{readable(application.application_status)}</span>}
+        description="Finish setup, upload your documents and submit your station for review."
+        action={<span className={`pill pill-${published ? "green" : statusTone(application.application_status)}`}>{readable(application.application_status)}</span>}
       />
-      <div className="application-grid">
-        <section className="panel">
-          <div className="panel-heading">
-            <div><h2>Business information</h2><p>Station identity and location submitted for review.</p></div>
-            <MapPin size={19} className="heading-icon" />
+
+      <section className="panel setup-hero">
+        <div className="setup-hero-top">
+          <div className={`setup-ring ${percent === 100 ? "is-complete" : ""}`} style={{ "--p": percent } as CSSProperties} role="img" aria-label={`${doneCount} of ${steps.length} steps complete`}>
+            <span><strong>{percent}%</strong><small>{doneCount}/{steps.length}</small></span>
           </div>
-          <dl className="detail-list">
-            <DetailRow label="Station name" value={application.display_name} />
-            <DetailRow label="Registered business" value={application.legal_business_name} />
-            <DetailRow label="Contact" value={`${application.phone}${application.email ? ` · ${application.email}` : ""}`} />
-            <DetailRow label="Address" value={[application.address_line, application.barangay, application.city, application.province, application.postal_code].filter(Boolean).join(", ")} />
-            <DetailRow label="Coordinates" value={application.latitude !== null && application.longitude !== null ? `${application.latitude}, ${application.longitude}` : "Not set"} />
-            <DetailRow label="Station status" value={`${readable(station?.verification_status ?? application.verification_status)} · ${readable(station?.publication_status ?? "unpublished")}`} />
-          </dl>
-          {application.application_status === "changes_requested" && (
-            <div className="notice notice-warning"><CircleAlert size={17} /><span>The reviewer requested changes. Check document notes, replace the required files, then resubmit.</span></div>
-          )}
-        </section>
-        <section className="panel">
-          <div className="panel-heading">
-            <div><h2>Required documents</h2><p>Upload the current files requested for station verification.</p></div>
-            <FileUp size={19} className="heading-icon" />
+          <div className="setup-hero-copy">
+            <span className="eyebrow">SETUP PROGRESS</span>
+            <h2>{headline}</h2>
+            <p>{subline}</p>
           </div>
-          {canSubmit && (showSubmissionReadiness || submissionBlockers.length > 0) && (
-            <div className={`notice ${submissionBlockers.length > 0 ? "notice-warning" : "notice-info"}`} role="status">
-              <CircleAlert size={17} />
-              <div>
-                <strong>
-                  {submissionBlockers.length > 0
-                    ? `Complete these ${submissionBlockers.length} item${submissionBlockers.length === 1 ? "" : "s"} before submitting`
-                    : "All seller setup checks are complete."}
-                </strong>
-                {submissionBlockers.length > 0 && (
-                  <ul className="submission-blocker-list">
-                    {submissionBlockers.map((blocker) => (
-                      <li key={`${blocker.label}-${blocker.detail}`}>
-                        <span><strong>{blocker.label}:</strong> {blocker.detail}</span>
-                        <button className="text-link" type="button" onClick={() => onNavigate(blocker.section)}>
-                          Go to page <ArrowRight size={14} />
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
+          {canSubmit && (
+            <div className="setup-hero-cta">
+              {nextStep ? (
+                <button className="button button-primary" type="button" onClick={() => goTo(nextStep)}>
+                  {nextStep.documentType ? `Upload ${nextStep.title}` : `Continue: ${nextStep.title}`} <ArrowRight size={16} />
+                </button>
+              ) : (
+                <button className="button button-primary" type="button" disabled={submitting} onClick={() => void submitApplication()}>
+                  {submitting ? <span className="spinner spinner-light" /> : <BadgeCheck size={16} />} Submit for review
+                </button>
+              )}
             </div>
           )}
+        </div>
+        <div className="setup-groups">
+          {groups.map((group) => {
+            const complete = group.done === group.items.length;
+            const firstOpen = group.items.find((item) => !item.done);
+            return (
+              <button
+                key={group.name}
+                type="button"
+                className={`setup-group ${complete ? "is-complete" : ""}`}
+                onClick={() => goTo(firstOpen ?? group.items[0])}
+              >
+                <span className="setup-group-icon">{complete ? <Check size={13} strokeWidth={3} /> : group.done}</span>
+                <span><strong>{group.name}</strong><small>{group.done} of {group.items.length} done</small></span>
+              </button>
+            );
+          })}
+        </div>
+        {application.application_status === "changes_requested" && (
+          <div className="notice notice-warning"><CircleAlert size={17} /><span>The reviewer asked for changes. Notes appear on the documents that need attention.</span></div>
+        )}
+      </section>
+
+      {canSubmit && pending.length > 0 && (
+        <section className="panel setup-todo">
+          <div className="panel-heading">
+            <div><h2>What's left</h2><p>Do these in order. Each one takes you straight to the right place.</p></div>
+          </div>
+          <ol>
+            {pending.map((item, index) => (
+              <li key={item.id}>
+                <span className="setup-todo-num">{index + 1}</span>
+                <div>
+                  <strong>{item.title}</strong>
+                  <p>{item.detail}</p>
+                </div>
+                <button className="button button-secondary button-small" type="button" onClick={() => goTo(item)}>
+                  {item.documentType ? "Upload" : `Open ${setupSectionLabel[item.section]}`} <ArrowRight size={14} />
+                </button>
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
+
+      <div className="setup-layout">
+        <section className="panel" id="documents">
+          <div className="panel-heading">
+            <div><h2>Required documents</h2><p>PDF, JPG, PNG or WebP · up to 20 MB each</p></div>
+            <FileUp size={19} className="heading-icon" />
+          </div>
           {requiredTypes.length === 0 ? (
             <div className="notice notice-warning"><CircleAlert size={17} /><span>No document requirements were returned. Refresh or contact support before submitting.</span></div>
           ) : (
-            <div className="document-list">
+            <div className="doc-grid">
               {requiredTypes.map((requirement) => {
-                const document = documents.find((item) =>
-                  item.document_type === requirement.document_type && item.required_for_verification,
-                );
+                const type = requirement.document_type;
+                const document = documents.find((item) => item.document_type === type && item.required_for_verification);
+                const step = steps.find((item) => item.documentType === type);
+                const isPermit = type === "business_permit";
+                const rejected = document?.review_status === "rejected";
+                const needsFix = Boolean(document && step && !step.done);
+                const permitReady = !isPermit || Boolean(permitExpiry && permitExpiry > localToday);
+                const editable = canSubmit && uploadingType === null;
+                const uploadDisabled = !editable || !permitReady;
+                const uploading = uploadingType === type;
                 return (
-                  <div className="document-row" key={requirement.document_type}>
-                    <span className={`document-icon ${document ? "document-icon-done" : ""}`}>{document ? <Check size={16} /> : <FileCheck2 size={16} />}</span>
-                    <div className="document-info">
-                      <strong>{readable(requirement.document_type)}</strong>
-                      <div className="document-meta">
-                        {document ? (
-                          <>
-                            <span className={`pill pill-${statusTone(document.review_status)}`}>{readable(document.review_status)}</span>
-                            {requirement.document_type === "business_permit" && <small>Expires {formatDate(document.expires_at)}</small>}
-                            {document.review_notes && <small className="document-note">{document.review_notes}</small>}
-                          </>
-                        ) : "Not uploaded yet"}
-                      </div>
-                    </div>
-                    <div className="document-actions">
-                      {requirement.document_type === "business_permit" && (
-                        <div className="permit-expiry-field">
-                          <input aria-label="Business permit expiration date" type="date" value={permitExpiry} onChange={(event) => setPermitExpiry(event.target.value)} />
-                          <small className="field-hint">Changing the date does not save it by itself. Upload or replace the permit to save the new expiry date.</small>
+                  <article
+                    id={`doc-${type}`}
+                    key={type}
+                    className={`doc-card ${document && !needsFix ? "has-file" : ""} ${rejected || needsFix ? "needs-fix" : ""} ${dragType === type ? "is-drag" : ""}`}
+                  >
+                    <header>
+                      <span className={`document-icon ${document && !needsFix ? "document-icon-done" : ""}`}>{document && !needsFix ? <Check size={16} /> : <FileCheck2 size={16} />}</span>
+                      <div>
+                        <strong>{readable(type)}</strong>
+                        <div className="document-meta">
+                          {document
+                            ? <span className={`pill pill-${needsFix ? "amber" : statusTone(document.review_status)}`}>{needsFix && !rejected ? "Needs update" : readable(document.review_status)}</span>
+                            : <span className="pill pill-gray">Not uploaded</span>}
+                          {isPermit && document?.expires_at && <small>Expires {formatDate(document.expires_at)}</small>}
                         </div>
-                      )}
-                      <label className={`button button-secondary button-small upload-button ${!canSubmit || uploadingType !== null ? "is-disabled" : ""}`}>
-                        {uploadingType === requirement.document_type ? <span className="spinner" /> : <FileUp size={14} />}
-                        {document ? "Replace" : "Upload"}
+                      </div>
+                    </header>
+                    {(rejected || needsFix) && step && <p className="doc-card-note"><CircleAlert size={14} /> {document?.review_notes || step.detail}</p>}
+                    {isPermit && (
+                      <label className="doc-expiry">
+                        <span>Permit expiry date</span>
                         <input
-                          type="file"
-                          accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/jpeg,image/png,image/webp"
-                          disabled={uploadingType !== null || !["draft", "changes_requested"].includes(application.application_status)}
-                          onChange={(event) => {
-                            const file = event.currentTarget.files?.[0];
-                            void uploadDocument(requirement.document_type, file);
-                            event.currentTarget.value = "";
-                          }}
+                          type="date"
+                          min={localTomorrow}
+                          value={permitExpiry}
+                          disabled={!canSubmit}
+                          onChange={(event) => setPermitExpiry(event.target.value)}
+                          aria-label="Business permit expiration date"
                         />
+                        <small>Saved together with the file you upload.</small>
                       </label>
-                    </div>
-                  </div>
+                    )}
+                    <label
+                      className={`doc-drop ${uploadDisabled ? "is-disabled" : ""}`}
+                      onDragOver={(event) => { if (!uploadDisabled) { event.preventDefault(); setDragType(type); } }}
+                      onDragLeave={() => setDragType((current) => (current === type ? null : current))}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        setDragType(null);
+                        if (!uploadDisabled) void uploadDocument(type, event.dataTransfer.files?.[0]);
+                      }}
+                    >
+                      <input
+                        type="file"
+                        accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/jpeg,image/png,image/webp"
+                        disabled={uploadDisabled}
+                        onChange={(event) => {
+                          const file = event.currentTarget.files?.[0];
+                          void uploadDocument(type, file);
+                          event.currentTarget.value = "";
+                        }}
+                      />
+                      {uploading ? (
+                        <><span className="spinner" /><span><strong>Uploading…</strong></span></>
+                      ) : (
+                        <>
+                          <FileUp size={18} />
+                          <span>
+                            <strong>{document ? "Replace file" : "Upload file"}</strong>
+                            <small>{!canSubmit ? "Locked while under review" : !permitReady ? "Choose the expiry date first" : "or drag it here"}</small>
+                          </span>
+                        </>
+                      )}
+                    </label>
+                  </article>
                 );
               })}
             </div>
@@ -4212,28 +4511,51 @@ function ApplicationSection({
                   ? "Your application is approved."
                   : application.application_status === "rejected"
                     ? "This application was not approved."
-                    : "Your application is under review. Documents are locked until the reviewer responds."
-                : submissionBlockers.length
-                  ? `${submissionBlockers.length} required setup item${submissionBlockers.length === 1 ? "" : "s"} remaining`
-                  : "All required setup and document checks are complete"}
+                    : "Under review. Documents unlock if the reviewer asks for changes."
+                : pending.length > 0
+                  ? `${pending.length} step${pending.length === 1 ? "" : "s"} left`
+                  : "All steps complete"}
             </span>
-            <button className="button button-primary" type="button" disabled={!canSubmit || submitting} onClick={() => void submitApplication()}>
+            <button className="button button-primary" type="button" disabled={!canSubmit || pending.length > 0 || submitting} onClick={() => void submitApplication()}>
               {submitting ? <span className="spinner spinner-light" /> : null}
               Submit for review <ArrowRight size={16} />
             </button>
           </div>
         </section>
+
+        <section className="panel" id="station-details">
+          <div className="panel-heading">
+            <div><h2>Station details</h2><p>What the review team sees.</p></div>
+            <MapPin size={19} className="heading-icon" />
+          </div>
+          <dl className="detail-list">
+            <DetailRow label="Station name" value={application.display_name} />
+            <DetailRow label="Registered business" value={application.legal_business_name} />
+            <DetailRow label="Contact" value={`${application.phone}${application.email ? ` · ${application.email}` : ""}`} />
+            <DetailRow label="Address" value={[application.address_line, application.barangay, application.city, application.province, application.postal_code].filter(Boolean).join(", ")} />
+            <DetailRow label="Map pin" value={application.latitude !== null && application.longitude !== null ? `${application.latitude}, ${application.longitude}` : "Not set"} />
+            <DetailRow label="Status" value={`${readable(station?.verification_status ?? application.verification_status)} · ${readable(station?.publication_status ?? "unpublished")}`} />
+          </dl>
+          {steps.some((item) => item.done) && (
+            <details className="setup-done">
+              <summary>{doneCount} step{doneCount === 1 ? "" : "s"} completed</summary>
+              <ul>
+                {steps.filter((item) => item.done).map((item) => (
+                  <li key={item.id}><Check size={13} strokeWidth={3} /> {item.title}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </section>
       </div>
-      {station?.verification_status !== "verified" ||
-      station.publication_status !== "published" ? (
+      {!published && (
         <div className="info-strip">
           <CircleAlert size={17} />
           <span>
-            Adding product information does not publish your station. Customers
-            see your active products only after verification and publication.
+            Adding products doesn't publish your station. Customers see your active products only after verification and publication.
           </span>
         </div>
-      ) : null}
+      )}
     </>
   );
 }
@@ -5144,15 +5466,47 @@ function NoticeBanner({ notice, onClose }: { notice: Notice; onClose: () => void
   const Icon = notice.kind === "success" ? Check : CircleAlert;
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
+  const exitRef = useRef<() => void>(() => {});
+  const [leaving, setLeaving] = useState(false);
+  const duration = notice.duration ?? (notice.kind === "error" ? 7000 : 3800);
   useEffect(() => {
-    const timer = window.setTimeout(() => closeRef.current(), 6000);
-    return () => window.clearTimeout(timer);
-  }, [notice]);
+    setLeaving(false);
+    let exitTimer = 0;
+    const startExit = () => {
+      setLeaving(true);
+      exitTimer = window.setTimeout(() => closeRef.current(), 220);
+    };
+    exitRef.current = startExit;
+    const timer = window.setTimeout(startExit, duration);
+    return () => {
+      window.clearTimeout(timer);
+      window.clearTimeout(exitTimer);
+    };
+  }, [notice, duration]);
   return (
-    <div className={`notice-banner notice-banner-${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
-      <Icon size={17} />
-      <span>{notice.text}</span>
-      <button type="button" aria-label="Dismiss message" onClick={onClose}><X size={16} /></button>
+    <div className="toast-layer">
+      <div
+        className={`toast toast-${notice.kind} ${leaving ? "is-leaving" : ""}`}
+        role={notice.kind === "error" ? "alert" : "status"}
+        style={{ "--toast-ms": `${duration}ms` } as CSSProperties}
+      >
+        <span className="toast-icon"><Icon size={13} strokeWidth={3} /></span>
+        <span className="toast-text">{notice.text}</span>
+        {notice.action && (
+          <button
+            className="toast-action"
+            type="button"
+            onClick={() => {
+              notice.action?.onClick();
+              exitRef.current();
+            }}
+          >
+            {notice.action.label}
+          </button>
+        )}
+        <button className="toast-close" type="button" aria-label="Dismiss message" onClick={() => exitRef.current()}><X size={14} /></button>
+        <span className="toast-timer" />
+      </div>
     </div>
   );
 }
