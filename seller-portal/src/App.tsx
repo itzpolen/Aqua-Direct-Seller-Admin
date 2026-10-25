@@ -4124,8 +4124,6 @@ function ApplicationSection({
   const requiredTypes = requirements.filter((requirement) => requirement.required);
   const today = new Date();
   const localToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
-  const tomorrowDate = new Date(today.getTime() + 86400000);
-  const localTomorrow = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth() + 1).padStart(2, "0")}-${String(tomorrowDate.getDate()).padStart(2, "0")}`;
   const activeProducts = products.filter((product) => product.status === "active");
   const activePolicyTypes = new Set(
     containerPolicies.filter((policy) => policy.is_active).map((policy) => policy.container_type_id),
@@ -4193,19 +4191,21 @@ function ApplicationSection({
     let done = false;
     let detail = `${name} is required and has not been uploaded.`;
     if (document) {
-      if (document.review_status === "rejected") {
+      if (document.review_status === "rejected" || document.review_status === "changes_requested") {
         detail = document.review_notes || `${name} was rejected. Upload a replacement before resubmitting.`;
       } else if (requirement.document_type === "business_permit") {
-        if (!permitExpiry || permitExpiry <= localToday) {
-          detail = "Choose a future expiry date, then upload the updated permit to save it.";
+        if (!permitExpiry || permitExpiry < localToday) {
+          detail = "Choose an expiry date that is today or later, then upload the updated permit to save it.";
         } else if (permitExpiry !== document.expires_at) {
           detail = "The new expiry date isn't saved yet. Upload the permit again to save it with the file.";
-        } else if (!document.expires_at || document.expires_at <= localToday) {
+        } else if (!document.expires_at || document.expires_at < localToday) {
           detail = "The saved permit has expired. Upload a current permit with a future expiry date.";
+        } else if (application.application_status === "approved" && document.review_status === "pending") {
+          detail = "Renewed permit submitted. Waiting for administrator review.";
         } else {
           done = true;
         }
-      } else if (document.expires_at !== null && document.expires_at <= localToday) {
+      } else if (document.expires_at !== null && document.expires_at < localToday) {
         detail = `${name} must have a future expiry date.`;
       } else {
         done = true;
@@ -4219,7 +4219,7 @@ function ApplicationSection({
   const staleDocument = documents.find((document) =>
     !requiredTypes.some((requirement) => requirement.document_type === document.document_type)
     && document.expires_at !== null
-    && document.expires_at <= localToday,
+    && document.expires_at < localToday,
   );
   if (staleDocument) {
     steps.push({
@@ -4235,6 +4235,16 @@ function ApplicationSection({
   const canSubmit = application.application_status === "draft"
     || application.application_status === "changes_requested";
   const published = station?.publication_status === "published";
+  const applicationComplete = published || application.application_status === "approved";
+  const canRenewPermit = application.application_status === "approved"
+    && permitDocument !== undefined
+    && permitDocument.review_status !== "pending"
+    && (
+      !permitDocument.expires_at
+      || permitDocument.expires_at < localToday
+      || permitDocument.review_status === "rejected"
+      || permitDocument.review_status === "changes_requested"
+    );
   const groups = (["Profile", "Delivery", "Products", "Documents"] as const)
     .map((name) => {
       const items = steps.filter((item) => item.group === name);
@@ -4282,8 +4292,12 @@ function ApplicationSection({
       onNotice({ kind: "error", text: "Upload a PDF, JPEG, PNG, or WebP file." });
       return;
     }
-    if (documentType === "business_permit" && (!permitExpiry || permitExpiry <= localToday)) {
-      onNotice({ kind: "error", text: "Choose a future permit expiry date first." });
+    if (documentType === "business_permit" && (!permitExpiry || permitExpiry < localToday)) {
+      onNotice({ kind: "error", text: "Choose a permit expiry date that is today or later first." });
+      return;
+    }
+    if (!canSubmit && !(documentType === "business_permit" && canRenewPermit)) {
+      onNotice({ kind: "error", text: "This document cannot be changed while the application is under review." });
       return;
     }
     setUploadingType(documentType);
@@ -4292,6 +4306,11 @@ function ApplicationSection({
     const sanitizedName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
     const path = `${application.id}/${id}/${sanitizedName}`;
     try {
+      const { error: storageError } = await supabase.storage.from("station-documents").upload(path, file, {
+        contentType: file.type,
+        upsert: false,
+      });
+      if (storageError) throw storageError;
       const { error: metadataError } = await supabase.from("station_documents").insert({
         id,
         application_id: application.id,
@@ -4302,15 +4321,19 @@ function ApplicationSection({
         is_current: true,
         expires_at: documentType === "business_permit" ? permitExpiry : null,
       });
-      if (metadataError) throw metadataError;
-      const { error: storageError } = await supabase.storage.from("station-documents").upload(path, file, {
-        contentType: file.type,
-        upsert: false,
-      });
-      if (storageError) {
-        throw new Error(`Document details were saved, but the file upload failed: ${storageError.message}. Try uploading again.`);
+      if (metadataError) {
+        const { error: cleanupError } = await supabase.storage.from("station-documents").remove([path]);
+        if (cleanupError) {
+          throw new Error(`Document details could not be saved (${metadataError.message}), and the uploaded file could not be cleaned up (${cleanupError.message}).`);
+        }
+        throw metadataError;
       }
-      onNotice({ kind: "success", text: `${readable(documentType)} uploaded` });
+      onNotice({
+        kind: "success",
+        text: application.application_status === "approved" && documentType === "business_permit"
+          ? "Renewed business permit submitted for administrator review."
+          : `${readable(documentType)} uploaded`,
+      });
       onRefresh();
     } catch (error) {
       onNotice({ kind: "error", text: error instanceof Error ? error.message : "Document could not be uploaded." });
@@ -4430,8 +4453,11 @@ function ApplicationSection({
                 const isPermit = type === "business_permit";
                 const rejected = document?.review_status === "rejected";
                 const needsFix = Boolean(document && step && !step.done);
-                const permitReady = !isPermit || Boolean(permitExpiry && permitExpiry > localToday);
-                const editable = canSubmit && uploadingType === null;
+                const renewalAwaitingReview = application.application_status === "approved"
+                  && document?.review_status === "pending"
+                  && Boolean(document.expires_at && document.expires_at >= localToday);
+                const permitReady = !isPermit || Boolean(permitExpiry && permitExpiry >= localToday);
+                const editable = (canSubmit || (isPermit && canRenewPermit)) && uploadingType === null;
                 const uploadDisabled = !editable || !permitReady;
                 const uploading = uploadingType === type;
                 return (
@@ -4446,7 +4472,7 @@ function ApplicationSection({
                         <strong>{readable(type)}</strong>
                         <div className="document-meta">
                           {document
-                            ? <span className={`pill pill-${needsFix ? "amber" : statusTone(document.review_status)}`}>{needsFix && !rejected ? "Needs update" : readable(document.review_status)}</span>
+                            ? <span className={`pill pill-${needsFix ? "amber" : statusTone(document.review_status)}`}>{renewalAwaitingReview ? "Renewal in review" : needsFix && !rejected ? "Needs update" : readable(document.review_status)}</span>
                             : <span className="pill pill-gray">Not uploaded</span>}
                           {isPermit && document?.expires_at && <small>Expires {formatDate(document.expires_at)}</small>}
                         </div>
@@ -4458,9 +4484,9 @@ function ApplicationSection({
                         <span>Permit expiry date</span>
                         <input
                           type="date"
-                          min={localTomorrow}
+                          min={localToday}
                           value={permitExpiry}
-                          disabled={!canSubmit}
+                          disabled={!canSubmit && !(isPermit && canRenewPermit)}
                           onChange={(event) => setPermitExpiry(event.target.value)}
                           aria-label="Business permit expiration date"
                         />
@@ -4494,7 +4520,7 @@ function ApplicationSection({
                           <FileUp size={18} />
                           <span>
                             <strong>{document ? "Replace file" : "Upload file"}</strong>
-                            <small>{!canSubmit ? "Locked while under review" : !permitReady ? "Choose the expiry date first" : "or drag it here"}</small>
+                            <small>{!editable ? "Locked while under review" : !permitReady ? "Choose the expiry date first" : application.application_status === "approved" && isPermit ? "Upload renewed permit for review" : "or drag it here"}</small>
                           </span>
                         </>
                       )}
@@ -4506,7 +4532,9 @@ function ApplicationSection({
           )}
           <div className="form-footer document-footer">
             <span className="muted-note">
-              {!canSubmit
+              {application.application_status === "approved" && permitDocument?.review_status === "pending"
+                ? "Renewed permit awaiting administrator review"
+                : !canSubmit
                 ? application.application_status === "approved"
                   ? "Your application is approved."
                   : application.application_status === "rejected"
@@ -4517,8 +4545,9 @@ function ApplicationSection({
                   : "All steps complete"}
             </span>
             <button className="button button-primary" type="button" disabled={!canSubmit || pending.length > 0 || submitting} onClick={() => void submitApplication()}>
-              {submitting ? <span className="spinner spinner-light" /> : null}
-              Submit for review <ArrowRight size={16} />
+              {submitting ? <span className="spinner spinner-light" /> : applicationComplete ? <Check size={16} /> : null}
+              {applicationComplete ? "Complete" : "Submit for review"}
+              {!applicationComplete && <ArrowRight size={16} />}
             </button>
           </div>
         </section>
